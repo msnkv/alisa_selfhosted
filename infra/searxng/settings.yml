@@ -1,0 +1,37 @@
+# Настройки локального SearXNG для голосового ассистента.
+# Берём дефолты апстрима и переопределяем только нужное.
+use_default_settings: true
+
+general:
+  instance_name: "alisa"
+  # Страница /stats и отладочные ответы нам не нужны.
+  enable_metrics: false
+
+server:
+  # Инстанс слушает только локально, наружу не торчит.
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "5932f16a670a563078a4c24713922f282adc02e1d18ebf188dc76f4d0caf076a"
+  # Лимитер защищает публичные инстансы от ботов. У нас единственный
+  # клиент - свой же ассистент, и лимитер только мешал бы ему.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  # json нужен нашему инструменту web_search; по умолчанию он выключен,
+  # и без этой строки API отвечает 403.
+  formats:
+    - html
+    - json
+  default_lang: "ru"
+  safe_search: 0
+  autocomplete: ""
+
+outgoing:
+  # Ассистент отвечает голосом, поэтому ждать поиск дольше нескольких
+  # секунд бессмысленно - лучше честно сказать, что не нашли.
+  request_timeout: 6.0
+  max_request_timeout: 10.0
+  pool_connections: 100
+  pool_maxsize: 20
