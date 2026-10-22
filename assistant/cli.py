@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from dataclasses import replace
 
 from .config import ROOT, load_config, setup_logging
@@ -20,7 +21,7 @@ from .llm import Answer, Assistant
 from .mic import make_microphone
 from .prompt import build_system_prompt, human_now
 from .stt import make_stt
-from .tts import SAMPLE_TEXT, SPEAKERS, describe_devices, make_tts
+from .tts import SAMPLE_TEXT, SPEAKERS, SpeechQueue, describe_devices, make_tts
 from .voice import VoiceLoop
 from .wake import make_wake_word
 
@@ -246,15 +247,35 @@ def render_voices(tts, text: str) -> int:
 
 
 def _respond(assistant: Assistant, tts, question: str) -> Answer | None:
+    # С озвучкой говорим потоком, как в голосовом режиме: так тут слышно
+    # ровно то, что услышишь из колонки, и видно замер до первого звука.
+    speech = None
+    if tts is not None and assistant.cfg.tts.stream:
+        speech = SpeechQueue(tts)
+        speech.start()
+
+    started = time.perf_counter()
     try:
-        answer = assistant.ask(question, on_tool_call=_announce_tool)
+        answer = assistant.ask(
+            question,
+            on_tool_call=_announce_tool,
+            on_sentence=speech.add if speech is not None else None,
+        )
     except Exception as exc:  # noqa: BLE001
+        if speech is not None:
+            speech.stop()
         print(f"  ошибка: {type(exc).__name__}: {exc}")
         return None
 
     print(f"\n{answer.text}")
     print(_stats(answer))
-    if tts is not None:
+
+    if speech is not None:
+        if speech.first_sound_at is not None:
+            print(f"  [до первого звука {speech.first_sound_at - started:.2f} с]")
+        speech.close()
+        speech.wait()
+    elif tts is not None:
         try:
             tts.say(answer.text)
         except Exception as exc:  # noqa: BLE001

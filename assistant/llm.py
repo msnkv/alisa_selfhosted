@@ -43,6 +43,49 @@ class Answer:
     search_empty: bool = False
 
 
+# Конец предложения: точка, восклицательный или вопросительный знак
+# после как минимум двух букв, а за ним пробел. Двух букв — чтобы не
+# разрывать сокращения вида «и т.д.»: там перед точкой одна буква.
+# Пробел — чтобы не отдавать в синтез обрубок, пока модель ещё печатает.
+_SENTENCE_END = re.compile(r"(?<=[^\W\d_]{2})[.!?…]+(?=\s)")
+
+
+def split_sentences(buffer: str) -> tuple[list[str], str]:
+    """Отрезает от буфера законченные предложения.
+
+    Возвращает готовые предложения и остаток, который модель ещё дописывает.
+    Резать надо по целому буферу, а не по обрезку до последнего знака:
+    правило требует пробела после точки, и если отрезать буфер ровно по
+    точке, последнее предложение этот пробел потеряет и не найдётся.
+    """
+    ready: list[str] = []
+    start = 0
+    for match in _SENTENCE_END.finditer(buffer):
+        sentence = clean_for_speech(buffer[start:match.end()])
+        if sentence:
+            ready.append(sentence)
+        start = match.end()
+    return ready, buffer[start:]
+
+
+@dataclass
+class _StreamedCall:
+    """Вызов инструмента, собранный из кусочков потока.
+
+    Поле function возвращает сам объект, чтобы остальной код не отличал
+    этот вызов от того, что приходит обычным, непотоковым ответом:
+    там обращаются к call.function.name и call.function.arguments.
+    """
+
+    id: str = ""
+    name: str = ""
+    arguments: str = ""
+
+    @property
+    def function(self) -> "_StreamedCall":
+        return self
+
+
 # Что сказать, если инструменты отработали, а ответа всё равно нет.
 GAVE_UP = (
     "Не смог найти надёжный ответ на этот вопрос, поэтому говорить ничего "
@@ -114,12 +157,20 @@ class Assistant:
         question: str,
         *,
         on_tool_call: Callable[[str, dict], None] | None = None,
+        on_sentence: Callable[[str], None] | None = None,
     ) -> Answer:
         """Задаёт вопрос модели, при необходимости гоняя её по инструментам.
 
         on_tool_call вызывается перед каждым обращением к инструменту. На
-        шаге 5 через него голосовой режим скажет «секунду, смотрю», чтобы
+        шаге 5 через него голосовой режим говорит «секунду, смотрю», чтобы
         в комнате не висела тишина.
+
+        on_sentence включает потоковый режим: ответ читается по мере
+        генерации, и каждое законченное предложение уходит в этот
+        обработчик сразу. Голосовой цикл отдаёт его в очередь синтеза и
+        начинает говорить, не дожидаясь конца ответа. Без обработчика
+        всё работает как раньше, одним ответом — так ходят тесты и
+        текстовый режим без озвучки.
         """
         system = build_system_prompt(
             name=self.cfg.name,
@@ -152,15 +203,12 @@ class Assistant:
             # словами, иначе цикл не закончится никогда.
             tools = None if (last_step or self.tools is None) else self.tools.SCHEMAS
 
-            response = self._create_with_fallback(messages, tools)
-            self._add_usage(totals, response.usage)
-            message = response.choices[0].message
+            content, calls, usage = self._step(messages, tools, on_sentence)
+            self._add_usage(totals, usage)
 
-            calls = getattr(message, "tool_calls", None)
             if not calls:
                 answer = self._finish(
-                    message.content or "", started, totals, step,
-                    tools_used, search_empty,
+                    content, started, totals, step, tools_used, search_empty,
                 )
                 self._remember(question, answer.text)
                 return answer
@@ -170,7 +218,7 @@ class Assistant:
                 # модель всё равно просит — честно сдаёмся.
                 break
 
-            messages.append(self._assistant_turn(message, calls))
+            messages.append(self._assistant_turn(content, calls))
             for call in calls:
                 name, arguments = self._parse_call(call)
                 tools_used.append(name)
@@ -218,7 +266,7 @@ class Assistant:
 
     # --- внутренности -----------------------------------------------------
 
-    def _create(self, messages: list[dict], tools: list[dict] | None):
+    def _create_kwargs(self, messages: list[dict], tools: list[dict] | None) -> dict:
         kwargs = {
             "model": self.cfg.llm.model,
             "messages": messages,
@@ -229,29 +277,111 @@ class Assistant:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        return self.client.chat.completions.create(**kwargs)
+        return kwargs
 
-    def _create_with_fallback(self, messages: list[dict], tools: list[dict] | None):
+    def _call_api(self, messages: list[dict], tools: list[dict] | None, *, stream: bool):
+        kwargs = self._create_kwargs(messages, tools)
+        if stream:
+            kwargs["stream"] = True
+            # Без этого в потоковом режиме расход токенов не приходит
+            # вообще, и мы перестанем видеть, что кэш промпта работает.
+            kwargs["stream_options"] = {"include_usage": True}
         try:
-            return self._create(messages, tools)
+            return self.client.chat.completions.create(**kwargs)
         except APIStatusError as exc:
             # Отключение размышлений — единственный нестандартный параметр,
             # который мы посылаем. Если сервер его не понял, пробуем без него.
-            if self._thinking_supported and self._extra_body() is not None:
+            if self._thinking_supported and kwargs.get("extra_body") is not None:
                 log.warning(
                     "сервер не принял отключение размышлений (%s), повторяю без него",
                     exc.status_code,
                 )
                 self._thinking_supported = False
-                return self._create(messages, tools)
+                kwargs["extra_body"] = None
+                return self.client.chat.completions.create(**kwargs)
             raise
 
+    def _step(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None,
+        on_sentence: Callable[[str], None] | None,
+    ):
+        """Один обмен с моделью. Возвращает текст, вызовы и расход токенов.
+
+        Форма ответа одна и та же, потоковый режим или нет, поэтому цикл
+        в ask про эту разницу ничего не знает.
+        """
+        if on_sentence is None:
+            response = self._call_api(messages, tools, stream=False)
+            message = response.choices[0].message
+            return (
+                message.content or "",
+                list(getattr(message, "tool_calls", None) or []),
+                response.usage,
+            )
+        return self._read_stream(
+            self._call_api(messages, tools, stream=True), on_sentence
+        )
+
     @staticmethod
-    def _assistant_turn(message, calls) -> dict:
+    def _read_stream(stream, on_sentence: Callable[[str], None]):
+        """Читает поток, отдавая законченные предложения по ходу дела.
+
+        Тонкость: заранее неизвестно, чем окажется шаг — текстом или
+        вызовом инструмента. Узнаём по тому, что приходит в кусочках, и
+        поэтому озвучивать начинаем сразу, как только пошёл текст. На
+        шаге с инструментами текста обычно нет вообще, так что лишнего
+        ассистент не скажет.
+        """
+        pieces: list[str] = []
+        buffer = ""
+        calls: dict[int, _StreamedCall] = {}
+        usage = None
+
+        for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+
+            # Вызовы инструментов приходят по частям: имя в одном кусочке,
+            # аргументы по буквам в следующих. Собираем их по номеру.
+            for part in getattr(delta, "tool_calls", None) or []:
+                call = calls.setdefault(part.index, _StreamedCall())
+                if part.id:
+                    call.id = part.id
+                function = getattr(part, "function", None)
+                if function is not None:
+                    if function.name:
+                        call.name = function.name
+                    if function.arguments:
+                        call.arguments += function.arguments
+
+            text = getattr(delta, "content", None)
+            if not text:
+                continue
+            pieces.append(text)
+            buffer += text
+            ready, buffer = split_sentences(buffer)
+            for sentence in ready:
+                on_sentence(sentence)
+
+        # Последнее предложение обычно без пробела на конце, поэтому
+        # разбивка его не отдаёт - отдаём здесь.
+        tail = clean_for_speech(buffer)
+        if tail:
+            on_sentence(tail)
+
+        return "".join(pieces), [calls[index] for index in sorted(calls)], usage
+
+    @staticmethod
+    def _assistant_turn(content: str, calls) -> dict:
         """Ход модели с вызовами инструментов, пересобранный для истории."""
         return {
             "role": "assistant",
-            "content": message.content or "",
+            "content": content or "",
             "tool_calls": [
                 {
                     "id": call.id,

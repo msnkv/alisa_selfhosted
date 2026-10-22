@@ -54,6 +54,7 @@ class TTSConfig:
     sample_rate: int
     device: str
     output_device: int | str | None
+    stream: bool
 
 
 @dataclass(frozen=True)
@@ -160,6 +161,7 @@ def load_config(path: Path | None = None) -> Config:
             sample_rate=int(tts.get("sample_rate", 48000)),
             device=tts.get("device", "cpu"),
             output_device=tts.get("output_device"),
+            stream=bool(tts.get("stream", True)),
         ),
         stt=STTConfig(
             enabled=bool(stt.get("enabled", True)),

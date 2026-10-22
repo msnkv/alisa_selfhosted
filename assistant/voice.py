@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from .config import Config
 from .llm import Assistant
+from .tts import SpeechQueue
 
 log = logging.getLogger(__name__)
 
@@ -40,13 +41,25 @@ class Timings:
     stt: float = 0.0
     llm: float = 0.0
     synth: float = 0.0
+    # Замеренное время до первого звука. В потоковом режиме складывать его
+    # из частей нельзя: синтез идёт внахлёст с генерацией, поэтому просто
+    # отмечаем момент, когда динамик заговорил.
+    first_sound: float = 0.0
 
     @property
     def to_first_sound(self) -> float:
         """Сколько человек ждёт в тишине после того, как договорил."""
+        if self.first_sound > 0:
+            return self.first_sound
         return self.stt + self.llm + self.synth
 
     def describe(self) -> str:
+        if self.first_sound > 0:
+            return (
+                f"запись {self.record:.1f} с | до первого звука "
+                f"{self.first_sound:.1f} с (поток) | ответ целиком "
+                f"{self.stt + self.llm:.1f} с"
+            )
         return (
             f"запись {self.record:.1f} с | до первого звука "
             f"{self.to_first_sound:.1f} с = распознавание {self.stt:.1f} "
@@ -129,6 +142,8 @@ class VoiceLoop:
             on_speech_start=lambda: print("  говоришь...")
         )
         timings.record = time.perf_counter() - started
+        # Момент «человек договорил»: от него и считается ожидание в тишине.
+        after_record = time.perf_counter()
 
         if len(audio) == 0:
             print("  речи не услышал")
@@ -152,19 +167,42 @@ class VoiceLoop:
             self.tts.say("Забыла, слушаю заново.")
             return None
 
+        # В потоковом режиме озвучка идёт параллельно генерации: очередь
+        # получает предложения по одному и начинает говорить с первого,
+        # не дожидаясь конца ответа.
+        speech = SpeechQueue(self.tts) if self.cfg.tts.stream else None
+        if speech is not None:
+            speech.start()
+
         started = time.perf_counter()
-        answer = self.assistant.ask(transcript.text, on_tool_call=self._say_filler)
+        try:
+            answer = self.assistant.ask(
+                transcript.text,
+                on_tool_call=self._say_filler,
+                on_sentence=speech.add if speech is not None else None,
+            )
+        except Exception:
+            if speech is not None:
+                speech.stop()
+            raise
         timings.llm = time.perf_counter() - started
 
         print(f"  {self.cfg.name}: {answer.text}")
 
-        started = time.perf_counter()
-        samples = self.tts.synthesize(answer.text)
-        timings.synth = time.perf_counter() - started
+        if speech is not None:
+            # Модель договорила, но динамик ещё догоняет остаток.
+            speech.close()
+            speech.wait()
+            if speech.first_sound_at is not None:
+                timings.first_sound = speech.first_sound_at - after_record
+        else:
+            started = time.perf_counter()
+            samples = self.tts.synthesize(answer.text)
+            timings.synth = time.perf_counter() - started
 
-        # Заглушка могла ещё звучать - обрываем, ответ важнее.
-        self.tts.stop()
-        self.tts.play(samples)
+            # Заглушка могла ещё звучать - обрываем, ответ важнее.
+            self.tts.stop()
+            self.tts.play(samples)
 
         log.info("голосовой круг: %s", timings.describe())
         print(f"  [{timings.describe()}]")
