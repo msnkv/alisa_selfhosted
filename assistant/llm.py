@@ -18,7 +18,7 @@ from openai import APIStatusError, OpenAI
 
 from .config import Config
 from .prompt import Knowledge, build_system_prompt, clean_for_speech
-from .search import SearchTools, make_backend
+from .search import EMPTY_RESULT_MARKER, SearchTools, make_backend
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +38,9 @@ class Answer:
     tokens_cached: int = 0
     steps: int = 1
     tools_used: list[str] = field(default_factory=list)
+    # Поиск сходил, но вернулся пустым. Отличает «поисковик не ответил»
+    # от «ассистент не справился» — важно при разборе прогона тестов.
+    search_empty: bool = False
 
 
 # Что сказать, если инструменты отработали, а ответа всё равно нет.
@@ -126,6 +129,7 @@ class Assistant:
         deadline = started + self.cfg.agent.total_timeout_s
         totals = {"in": 0, "out": 0, "cached": 0}
         tools_used: list[str] = []
+        search_empty = False
         step = 0
 
         while True:
@@ -143,7 +147,8 @@ class Assistant:
             calls = getattr(message, "tool_calls", None)
             if not calls:
                 return self._finish(
-                    message.content or "", started, totals, step, tools_used
+                    message.content or "", started, totals, step,
+                    tools_used, search_empty,
                 )
 
             if last_step:
@@ -158,6 +163,8 @@ class Assistant:
                 if on_tool_call is not None:
                     on_tool_call(name, arguments)
                 result = self.tools.call(name, arguments)
+                if EMPTY_RESULT_MARKER in result:
+                    search_empty = True
                 messages.append(
                     {
                         "role": "tool",
@@ -172,7 +179,9 @@ class Assistant:
                     self.cfg.agent.total_timeout_s, step,
                 )
 
-        return self._finish(GAVE_UP, started, totals, step, tools_used)
+        return self._finish(
+            GAVE_UP, started, totals, step, tools_used, search_empty
+        )
 
     # --- внутренности -----------------------------------------------------
 
@@ -250,6 +259,7 @@ class Assistant:
         totals: dict,
         steps: int,
         tools_used: list[str],
+        search_empty: bool = False,
     ) -> Answer:
         answer = Answer(
             text=clean_for_speech(text) or GAVE_UP,
@@ -259,6 +269,7 @@ class Assistant:
             tokens_cached=totals["cached"],
             steps=steps,
             tools_used=tools_used,
+            search_empty=search_empty,
         )
         log.info(
             "ответ за %.2f с, шагов %d, инструменты %s, вход %d (из кэша %d), выход %d",

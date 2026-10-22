@@ -18,6 +18,10 @@ from trafilatura.settings import use_config
 
 log = logging.getLogger(__name__)
 
+# По этой подстроке и цикл, и прогон тестов отличают «поиск не ответил»
+# от «ассистент сам не справился». Менять только вместе с llm.py.
+EMPTY_RESULT_MARKER = "ничего не вернул"
+
 
 @dataclass(frozen=True)
 class SearchResult:
@@ -161,7 +165,7 @@ class SearchTools:
 
         if not results:
             return (
-                f"Поиск по запросу «{query}» ничего не вернул. "
+                f"Поиск по запросу «{query}» {EMPTY_RESULT_MARKER}. "
                 "Попробуй переформулировать запрос или скажи, что проверить не удалось."
             )
 
