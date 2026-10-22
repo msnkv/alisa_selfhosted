@@ -142,27 +142,24 @@ class VoiceLoop:
             return
 
         speech = self._speech
-        if speech is None:
-            # Непотоковый режим: играть больше нечему, канал свободен.
-            try:
-                self.tts.play_async(self._filler_audio)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("заглушка не прозвучала: %s", exc)
+        if speech is not None and speech.committed:
+            # Ответ уже пошёл в динамик - заглушка теперь только помешает.
             return
 
-        # Заглушка нужна ровно для того, чтобы не висела тишина. Значит
-        # говорить её можно только в тишину: если канал занят - молчим.
-        # Это закрывает два случая разом: модель сама что-то сказала
-        # перед вызовом инструмента («сейчас уточню цены»), и несколько
-        # вызовов подряд. Без этой проверки на четырёх вызовах звучало
-        # четыре «секунду, смотрю», в том числе поверх ответа.
-        if speech.pending > 0:
-            return
+        # Не чаще, чем раз в FILLER_GAP_S. Инструмент вызывается по
+        # несколько раз на вопрос, и без этого на четырёх вызовах звучало
+        # четыре «секунду, смотрю» подряд.
         now = time.perf_counter()
         if now - self._filler_at < FILLER_GAP_S:
             return
         self._filler_at = now
-        speech.add_audio(self._filler_audio)
+        try:
+            # play_async идёт через тот же замок на вывод, что и ответ,
+            # поэтому наложиться на него не может: кто успел, того и
+            # динамик, а второй ждёт.
+            self.tts.play_async(self._filler_audio)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("заглушка не прозвучала: %s", exc)
 
     def listen_and_answer(
         self, *, wait_speech_s: float | None = None
@@ -215,13 +212,25 @@ class VoiceLoop:
         if speech is not None:
             speech.start()
 
-        # Запоминаем всё, что ушло в озвучку: напечатанное должно
-        # совпадать со сказанным, иначе разбирать жалобы невозможно.
-        said: list[str] = []
+        # Модель пишет текст на любом шаге, в том числе на том, где
+        # вызывает инструмент. Синтез начинаем сразу, а говорить даём
+        # только когда шаг закончился и оказался текстовым: иначе
+        # присказка вроде «сейчас уточню цены» звучит, а потом тот же
+        # ответ приходит ещё раз - и получается ответ, сказанный дважды.
+        unspoken: list[str] = []
+        step_text: list[str] = []
 
         def on_sentence(sentence: str) -> None:
-            said.append(sentence)
+            step_text.append(sentence)
             speech.add(sentence)
+
+        def on_step(used_tools: bool) -> None:
+            if used_tools:
+                unspoken.extend(step_text)
+                speech.discard()
+            else:
+                speech.commit()
+            step_text.clear()
 
         started = time.perf_counter()
         try:
@@ -229,6 +238,7 @@ class VoiceLoop:
                 transcript.text,
                 on_tool_call=self._say_filler,
                 on_sentence=on_sentence if speech is not None else None,
+                on_step=on_step if speech is not None else None,
             )
         except Exception:
             if speech is not None:
@@ -238,15 +248,18 @@ class VoiceLoop:
             self._speech = None
         timings.llm = time.perf_counter() - started
 
-        # Модель иногда говорит что-то и на шаге с инструментом: «сейчас
-        # уточню цены». В answer.text этого нет - там только последний
-        # шаг, - но прозвучать оно успело, поэтому печатаем отдельно.
-        aside = [phrase for phrase in said if phrase not in answer.text]
-        if aside:
-            print(f"  {self.cfg.name} (по ходу): {' '.join(aside)}")
+        # Что модель сказала по ходу, но вслух не пошло. Печатаем, чтобы
+        # было видно: в логах иначе непонятно, куда делись её слова.
+        if unspoken:
+            print(f"  {self.cfg.name} (не вслух): {' '.join(unspoken)}")
         print(f"  {self.cfg.name}: {answer.text}")
 
         if speech is not None:
+            if not speech.committed:
+                # Досюда доходим, когда ответа как такового не было:
+                # цикл сдался и подставил свою фразу. Её и говорим.
+                speech.add(answer.text)
+                speech.commit()
             # Модель договорила, но динамик ещё догоняет остаток.
             speech.close()
             speech.wait()
@@ -346,7 +359,10 @@ class VoiceLoop:
                 if timings is None or self.cfg.wake.follow_up_s <= 0:
                     break
                 wait = self.cfg.wake.follow_up_s
-                print("  (уточняй сразу, без кодовой фразы)")
+                print(
+                    f"  (уточняй сразу, без кодовой фразы — слушаю"
+                    f" {wait:.0f} с)"
+                )
 
             # Пауза, чтобы ассистент не поймал кодовую фразу в собственном
             # ответе из колонок. С наушниками не нужна, с динамиками важна.

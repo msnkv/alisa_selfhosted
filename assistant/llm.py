@@ -176,6 +176,7 @@ class Assistant:
         *,
         on_tool_call: Callable[[str, dict], None] | None = None,
         on_sentence: Callable[[str], None] | None = None,
+        on_step: Callable[[bool], None] | None = None,
     ) -> Answer:
         """Задаёт вопрос модели, при необходимости гоняя её по инструментам.
 
@@ -189,6 +190,11 @@ class Assistant:
         начинает говорить, не дожидаясь конца ответа. Без обработчика
         всё работает как раньше, одним ответом — так ходят тесты и
         текстовый режим без озвучки.
+
+        on_step зовётся после каждого шага и говорит, оказался шаг
+        вызовом инструмента или текстом. Это нужно озвучке: текст с
+        шага с инструментом — не ответ, а присказка, и говорить его
+        нельзя, иначе ответ прозвучит дважды.
         """
         system = build_system_prompt(
             name=self.cfg.name,
@@ -230,6 +236,8 @@ class Assistant:
 
             content, calls, usage = self._step(messages, tools, on_sentence)
             self._add_usage(totals, usage)
+            if on_step is not None:
+                on_step(bool(calls))
 
             if not calls:
                 answer = self._finish(

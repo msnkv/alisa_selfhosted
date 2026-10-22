@@ -259,12 +259,21 @@ def _respond(assistant: Assistant, tts, question: str) -> Answer | None:
         speech = SpeechQueue(tts)
         speech.start()
 
+    def on_step(used_tools: bool) -> None:
+        # Как в голосовом режиме: текст с шага с инструментом - присказка,
+        # а не ответ, и озвучивать его нельзя.
+        if used_tools:
+            speech.discard()
+        else:
+            speech.commit()
+
     started = time.perf_counter()
     try:
         answer = assistant.ask(
             question,
             on_tool_call=_announce_tool,
             on_sentence=speech.add if speech is not None else None,
+            on_step=on_step if speech is not None else None,
         )
     except Exception as exc:  # noqa: BLE001
         if speech is not None:
@@ -276,6 +285,9 @@ def _respond(assistant: Assistant, tts, question: str) -> Answer | None:
     print(_stats(answer))
 
     if speech is not None:
+        if not speech.committed:
+            speech.add(answer.text)
+            speech.commit()
         # Сначала дать договорить, потом печатать замер: до этого момента
         # первого звука могло ещё не случиться.
         speech.close()

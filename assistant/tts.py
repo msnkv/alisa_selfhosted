@@ -26,6 +26,15 @@ log = logging.getLogger(__name__)
 
 SILERO_REPO = "snakers4/silero-models"
 
+# Весь вывод звука в процессе проходит через этот замок. Причина дорогая:
+# sounddevice держит один поток вывода в своей глобальной переменной, и
+# каждый sd.play останавливает предыдущий и записывает туда себя. Два
+# одновременных вызова из разных потоков эту переменную портят -
+# живыми остаются два потока вывода, а библиотека знает про один.
+# Слышно это было как два голоса сразу, а sd.wait() при этом возвращался
+# раньше, чем звук кончился. Поэтому: один играет - остальные ждут.
+_SOUND_LOCK = threading.Lock()
+
 # Голоса русской модели v5. Послушать все: .\alisa.ps1 --voices "фраза"
 SPEAKERS = ("aidar", "baya", "kseniya", "xenia", "eugene")
 
@@ -154,10 +163,12 @@ class SileroTTS:
         self.play(samples)
 
     def play(self, samples: np.ndarray) -> None:
+        """Проигрывает и ждёт конца. Под замком — см. `_SOUND_LOCK`."""
         import sounddevice as sd
 
-        sd.play(samples, samplerate=self.sample_rate, device=self.output_device)
-        sd.wait()
+        with _SOUND_LOCK:
+            sd.play(samples, samplerate=self.sample_rate, device=self.output_device)
+            sd.wait()
 
     def play_async(self, samples: np.ndarray) -> None:
         """Запускает воспроизведение и сразу возвращает управление.
@@ -165,10 +176,13 @@ class SileroTTS:
         Нужно для фразы-заглушки: пока она звучит, ассистент уже должен
         искать. Если ждать её конца, заглушка сама добавит полторы секунды
         к задержке, от которой мы ею же и спасаемся.
-        """
-        import sounddevice as sd
 
-        sd.play(samples, samplerate=self.sample_rate, device=self.output_device)
+        Внутри — обычный `play` в отдельном потоке, чтобы и эта фраза
+        прошла через замок на вывод, а не в обход него.
+        """
+        threading.Thread(
+            target=self.play, args=(samples,), name="tts-async", daemon=True
+        ).start()
 
     def stop(self) -> None:
         """Обрывает то, что играет сейчас.
@@ -189,27 +203,32 @@ class SileroTTS:
 
 
 class SpeechQueue:
-    """Единственный канал звука на один круг разговора.
+    """Озвучка ответа по предложениям, с синтезом заранее.
 
-    Через неё проходит всё, что ассистент произносит: и фраза-заглушка,
-    и предложения ответа по мере генерации. Это не удобство, а
-    необходимость, и причина дорогая.
+    Как это работает и зачем так сложно.
 
-    `sounddevice` держит один поток вывода в своей глобальной переменной:
-    каждый `sd.play` останавливает предыдущий и записывает туда себя.
-    Пока заглушка играла из главного потока, а ответ — из потока
-    воспроизведения, два вызова дрались за эту переменную. Выигрывали
-    оба: живыми оставались два потока вывода, а библиотека знала про
-    один. В комнате это звучало как два разных ответа одновременно.
-    Поэтому `sd.play` вызывает ровно один поток — `_play_loop`, и
-    никто больше.
+    Модель отвечает в несколько шагов: сходить в поиск, прочитать
+    страницу, и только потом ответить. Текст она при этом может писать на
+    любом шаге — в том числе на том, где вызывает инструмент. Озвучивать
+    такой текст нельзя: он не ответ, а присказка вроде «сейчас уточню
+    цены», и дальше тот же ответ придёт ещё раз. Вживую это звучало как
+    ответ, сказанный дважды.
 
-    Потоков синтеза и воспроизведения два, а не один: пока динамик
-    играет текущее предложение, синтезатор готовит следующее. Синтез
-    быстрее реального времени примерно в пятнадцать раз, поэтому после
-    первой фразы речь идёт без разрывов. Порядок гарантирует одна
-    очередь на входе: готовая заглушка и ещё не синтезированные
-    предложения лежат в ней вместе и проходят дальше строго по одному.
+    Но и ждать конца всей генерации, чтобы начать синтез, расточительно.
+    Поэтому разведены два момента: **синтез начинается сразу**, как
+    только предложение готово, а **воспроизведение — только после
+    `commit`**, то есть когда шаг закончился и оказался текстовым. Если
+    шаг оказался с вызовом инструмента, зовётся `discard`, и
+    насинтезированное просто выбрасывается.
+
+    Выброс сделан через номер поколения, а не через чистку очередей: поток
+    синтеза может быть в середине работы, и отнимать у него очередь —
+    гонка. Вместо этого у каждой фразы есть номер, `discard` его
+    увеличивает, и динамик молча пропускает всё с устаревшим номером.
+
+    Потоков два: пока динамик играет текущее предложение, синтезатор
+    готовит следующее. Синтез быстрее реального времени примерно в
+    пятнадцать раз, поэтому речь идёт без разрывов.
     """
 
     def __init__(self, tts: SileroTTS) -> None:
@@ -219,23 +238,13 @@ class SpeechQueue:
         self._synth: threading.Thread | None = None
         self._player: threading.Thread | None = None
         self._stopped = threading.Event()
-        # Момент, когда из динамика пошёл первый звук ОТВЕТА. Заглушка
-        # не считается: она для того и нужна, чтобы звучать раньше него.
+        # Разрешение говорить. Снято, пока не ясно, текстовый ли это шаг.
+        self._allowed = threading.Event()
+        self._generation = 0
+        # Момент, когда из динамика пошёл первый звук ответа.
         self.first_sound_at: float | None = None
-        # Сколько всего поставлено в очередь. По этому счётчику голосовой
-        # цикл решает, нужна ли заглушка вообще: если модель уже что-то
-        # сказала, заглушка будет лишней болтовнёй поверх её слов.
-        self.added = 0
+        self.committed = False
         self.spoken: list[str] = []
-
-    @property
-    def pending(self) -> int:
-        """Сколько фраз ещё не договорено: в синтезе или в динамике.
-
-        По нему голосовой цикл решает, свободен ли канал. Ноль означает
-        тишину - и только тогда имеет смысл сказать заглушку.
-        """
-        return max(0, self.added - len(self.spoken))
 
     def start(self) -> None:
         self._synth = threading.Thread(
@@ -247,27 +256,25 @@ class SpeechQueue:
         self._synth.start()
         self._player.start()
 
-    def add(self, sentence: str, *, kind: str = "answer") -> None:
-        """Отдать очередное предложение в синтез."""
+    # --- вход -------------------------------------------------------------
+
+    def add(self, sentence: str) -> None:
+        """Отдать предложение в синтез. Говорить его пока нельзя."""
         if self._stopped.is_set():
             return
         sentence = sentence.strip()
-        if not sentence:
-            return
-        self.added += 1
-        self._texts.put((kind, sentence))
+        if sentence:
+            self._texts.put((sentence, self._generation))
 
-    def add_audio(self, samples, *, kind: str = "filler") -> None:
-        """Поставить в очередь уже синтезированное.
+    def commit(self) -> None:
+        """Шаг оказался текстовым: это ответ, можно говорить."""
+        self.committed = True
+        self._allowed.set()
 
-        Заглушка синтезируется один раз при прогреве, гонять её через
-        синтез заново незачем. Но в очередь она идёт в ту же самую,
-        иначе порядок перестанет быть порядком.
-        """
-        if self._stopped.is_set() or samples is None or len(samples) == 0:
-            return
-        self.added += 1
-        self._texts.put((kind, samples))
+    def discard(self) -> None:
+        """Шаг оказался вызовом инструмента: сказанное там не ответ."""
+        self._generation += 1
+        self._allowed.clear()
 
     def close(self) -> None:
         """Предложений больше не будет; дать потокам договорить."""
@@ -283,6 +290,8 @@ class SpeechQueue:
         import sounddevice as sd
 
         self._stopped.set()
+        # Разрешение ставим тоже, иначе динамик навсегда повиснет на нём.
+        self._allowed.set()
         self._texts.put(None)
         self._audio.put(None)
         sd.stop()
@@ -296,45 +305,40 @@ class SpeechQueue:
                 # None дальше по цепочке: он скажет динамику, что всё.
                 self._audio.put(None)
                 return
-            kind, payload = item
-            if isinstance(payload, np.ndarray):
-                self._audio.put((kind, "(готовая фраза)", payload))
+            sentence, generation = item
+            if generation != self._generation:
                 continue
             try:
-                samples = self.tts.synthesize(payload)
+                samples = self.tts.synthesize(sentence)
             except Exception as exc:  # noqa: BLE001
-                # Одно неудачное предложение не должно рушить весь ответ:
-                # остальные скажем, а причину оставим в логе.
-                log.warning("не синтезировала «%s»: %s", payload, exc)
+                # Одно неудачное предложение не должно рушить весь ответ.
+                log.warning("не синтезировала «%s»: %s", sentence, exc)
                 continue
             if len(samples):
-                self._audio.put((kind, payload, samples))
+                self._audio.put((sentence, samples, generation))
 
     def _play_loop(self) -> None:
-        import sounddevice as sd
-
-        opened = False
         while True:
             item = self._audio.get()
             if item is None or self._stopped.is_set():
                 return
-            kind, label, samples = item
-            if not opened:
-                # Отзыв «да?» мог ещё звучать — обрываем его.
-                sd.stop()
-                opened = True
-            if kind == "answer" and self.first_sound_at is None:
+            sentence, samples, generation = item
+            if generation != self._generation:
+                # Сказанное на шаге с инструментом - не ответ.
+                log.info("не озвучиваю «%s»: шаг оказался не ответом", sentence)
+                continue
+
+            self._allowed.wait()
+            if self._stopped.is_set() or generation != self._generation:
+                continue
+
+            if self.first_sound_at is None:
                 self.first_sound_at = time.perf_counter()
             try:
-                sd.play(
-                    samples,
-                    samplerate=self.tts.sample_rate,
-                    device=self.tts.output_device,
-                )
-                sd.wait()
+                self.tts.play(samples)
             except Exception as exc:  # noqa: BLE001
-                log.warning("не проиграла «%s»: %s", label, exc)
-            self.spoken.append(label)
+                log.warning("не проиграла «%s»: %s", sentence, exc)
+            self.spoken.append(sentence)
 
 
 ENGINES = {"silero": SileroTTS}
