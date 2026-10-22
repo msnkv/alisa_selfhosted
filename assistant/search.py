@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import logging
+import queue
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -56,13 +58,15 @@ class DdgsBackend:
         engine: str = "auto",
         safesearch: str = "off",
         retries: int = 2,
-        retry_pause_s: float = 0.7,
+        hedge_after_s: float = 2.5,
+        timeout_s: float = 18.0,
     ) -> None:
         self.region = region
         self.engine = engine
         self.safesearch = safesearch
         self.retries = retries
-        self.retry_pause_s = retry_pause_s
+        self.hedge_after_s = hedge_after_s
+        self.timeout_s = timeout_s
 
     def _simplify(self, query: str) -> str:
         words = query.rstrip("?！!.").split()
@@ -79,44 +83,130 @@ class DdgsBackend:
             backend=self.engine,
         )
 
+    @staticmethod
+    def _convert(raw: list[dict]) -> list[SearchResult]:
+        return [
+            SearchResult(
+                title=(item.get("title") or "").strip(),
+                url=(item.get("href") or "").strip(),
+                snippet=(item.get("body") or "").strip(),
+            )
+            for item in raw
+        ]
+
     def search(self, query: str, max_results: int) -> list[SearchResult]:
-        # Движки отвечают через раз: один и тот же запрос то приносит
-        # результаты, то падает с «No results found», причём на всех движках
-        # сразу. Проверено руками — это не про конкретные слова, а про
-        # троттлинг на стороне поисковиков. Поэтому пробуем несколько раз,
-        # а на последней попытке упрощаем запрос.
+        """Ищет, пуская попытки внахлёст, и берёт первый непустой ответ.
+
+        Движки отвечают через раз: один и тот же запрос то приносит
+        результаты, то падает с «No results found», причём на всех движках
+        сразу. Проверено руками — это не про конкретные слова, а про
+        троттлинг на стороне поисковиков.
+
+        Раньше попытки шли одна за другой, и неудача первой стоила всего
+        её времени целиком. Замеры показали, почему это дорого: одна
+        попытка занимает от двух до десяти секунд при медиане около пяти,
+        а падает примерно каждая четвёртая. То есть дело не только в
+        отказах, а в разбросе — и лечится он не ожиданием, а запуском
+        второй попытки, не дожидаясь первой.
+
+        Поэтому: пускаем первую, и если за `hedge_after_s` ответа нет,
+        добавляем следующую, не отменяя предыдущую. Кто ответил первым —
+        того и берём. Если попытка падает сразу, следующая стартует
+        немедленно, без ожидания.
+        """
         attempts = [query] * max(1, self.retries)
+        # Последняя попытка идёт с упрощённым запросом: без «какая» и
+        # «сколько» поисковики отвечают охотнее.
         simplified = self._simplify(query)
         if simplified != query:
             attempts.append(simplified)
 
-        for number, attempt_query in enumerate(attempts, 1):
-            if number > 1:
-                time.sleep(self.retry_pause_s)
+        answers: queue.Queue = queue.Queue()
+        started = time.perf_counter()
+        # Общий срок на весь поиск. Без него висящая попытка тянет время
+        # на себя: замеры дали двадцать секунд там, где ответа всё равно
+        # не было. Голосу столько ждать нельзя.
+        deadline = started + self.timeout_s
+
+        def run(number: int, text: str) -> None:
             try:
-                raw = self._attempt(attempt_query, max_results)
-            except Exception as exc:
+                raw = self._attempt(text, max_results)
+            except Exception as exc:  # noqa: BLE001
+                answers.put((number, text, None, exc))
+            else:
+                answers.put((number, text, raw, None))
+
+        def launch(number: int) -> None:
+            # Потоки демонские: если ответ уже получен, оставшиеся попытки
+            # никого не держат и не мешают процессу закончиться.
+            threading.Thread(
+                target=run,
+                args=(number + 1, attempts[number]),
+                name="search-%d" % (number + 1),
+                daemon=True,
+            ).start()
+
+        launched = 0
+        running = 0
+
+        while launched < len(attempts) or running > 0:
+            if running == 0:
+                # Ждать нечего — либо это самая первая попытка, либо
+                # предыдущая уже отвалилась. Пускаем следующую сразу.
+                launch(launched)
+                launched += 1
+                running += 1
+
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                log.warning(
+                    "поиск %r: срок %.0f с вышел, попыток было %d",
+                    query, self.timeout_s, launched,
+                )
+                break
+
+            more = launched < len(attempts)
+            try:
+                number, text, raw, exc = answers.get(
+                    timeout=min(self.hedge_after_s, remaining) if more else remaining
+                )
+            except queue.Empty:
+                if more:
+                    log.info(
+                        "поиск %r: ответа нет за %.1f с, пускаю попытку %d внахлёст",
+                        query, self.hedge_after_s, launched + 1,
+                    )
+                    launch(launched)
+                    launched += 1
+                    running += 1
+                    continue
+                log.warning(
+                    "поиск %r: все попытки повисли, бросаю через %.0f с",
+                    query, self.timeout_s,
+                )
+                break
+
+            running -= 1
+            if exc is not None:
                 log.warning(
                     "поиск %r попытка %d/%d не удалась (%s): %s",
-                    attempt_query, number, len(attempts), type(exc).__name__, exc,
+                    text, number, len(attempts), type(exc).__name__, exc,
                 )
                 continue
-
             if raw:
-                if number > 1:
-                    log.info("поиск удался с попытки %d, запрос %r", number, attempt_query)
-                return [
-                    SearchResult(
-                        title=(item.get("title") or "").strip(),
-                        url=(item.get("href") or "").strip(),
-                        snippet=(item.get("body") or "").strip(),
-                    )
-                    for item in raw
-                ]
+                log.info(
+                    "поиск удался с попытки %d за %.2f с, запрос %r",
+                    number, time.perf_counter() - started, text,
+                )
+                return self._convert(raw)
+            log.info("поиск %r попытка %d вернулась пустой", text, number)
 
         # Для ассистента полная неудача — это просто пустой список:
         # он честно скажет, что проверить не удалось.
-        log.warning("поиск %r не дал результатов за %d попыток", query, len(attempts))
+        log.warning(
+            "поиск %r не дал результатов за %d попыток и %.2f с",
+            query, launched, time.perf_counter() - started,
+        )
         return []
 
 

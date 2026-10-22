@@ -34,6 +34,8 @@ class SearchConfig:
     region: str
     max_results: int
     retries: int
+    hedge_after_s: float
+    timeout_s: float
     page_chars: int
     fetch_timeout_s: int
 
@@ -145,6 +147,8 @@ def load_config(path: Path | None = None) -> Config:
             region=search.get("region", "ru-ru"),
             max_results=int(search.get("max_results", 5)),
             retries=int(search.get("retries", 2)),
+            hedge_after_s=float(search.get("hedge_after_s", 2.5)),
+            timeout_s=float(search.get("timeout_s", 18)),
             page_chars=int(search.get("page_chars", 6000)),
             fetch_timeout_s=int(search.get("fetch_timeout_s", 8)),
         ),

@@ -120,6 +120,8 @@ class Assistant:
                 region=cfg.search.region,
                 engine=cfg.search.engine,
                 retries=cfg.search.retries,
+                hedge_after_s=cfg.search.hedge_after_s,
+                timeout_s=cfg.search.timeout_s,
             )
             self.tools = SearchTools(
                 backend,
