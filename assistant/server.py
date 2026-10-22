@@ -152,7 +152,9 @@ PAGE = """<!doctype html>
     padding: 14px; border-radius: 12px; border: 1px solid #8884;
   }
   button { margin-top: 10px; cursor: pointer; }
-  #talk { padding: 28px; font-size: 1.1rem; }
+  /* touch-action: none - иначе палец на кнопке прокручивает страницу,
+     и запись обрывается на середине фразы. */
+  #talk { padding: 28px; font-size: 1.1rem; touch-action: none; }
   #talk.recording { background: #c0392b; color: white; }
   .note { color: #8889; font-size: 0.85rem; margin-top: 1.5rem; }
   .heard { color: #8889; font-size: 0.9rem; }
@@ -182,12 +184,27 @@ PAGE = """<!doctype html>
 const out = document.getElementById("out");
 const player = document.getElementById("player");
 
+function line(text, cls) {
+  const node = document.createElement(cls === "p" ? "p" : "div");
+  if (cls !== "p") node.className = cls;
+  // textContent, а не innerHTML: это текст от модели, и вставлять его
+  // как разметку незачем.
+  node.textContent = text;
+  return node;
+}
+
 function show(data) {
+  out.textContent = "";
   if (data.error) { out.textContent = "Ошибка: " + data.error; return; }
-  const heard = data.heard ? `<div class="heard">услышала: ${data.heard}</div>` : "";
-  const meta = data.seconds ? `<div class="heard">${data.seconds} с${
-    data.tools && data.tools.length ? ", искала в интернете" : ""}</div>` : "";
-  out.innerHTML = heard + "<p>" + data.text + "</p>" + meta;
+  if (data.heard) out.append(line("услышала: " + data.heard, "heard"));
+  out.append(line(data.text, "p"));
+  if (data.seconds) {
+    out.append(line(
+      data.seconds + " с" +
+        (data.tools && data.tools.length ? ", искала в интернете" : ""),
+      "heard"
+    ));
+  }
   if (data.audio) {
     player.src = "data:audio/wav;base64," + data.audio;
     player.play().catch(() => {});
@@ -260,8 +277,24 @@ function stopTalking() {
 
 talk.addEventListener("pointerdown", startTalking);
 talk.addEventListener("pointerup", stopTalking);
+// pointerleave тут намеренно нет: на телефоне палец легко съезжает с
+// кнопки, и запись обрывалась бы на середине фразы.
 talk.addEventListener("pointercancel", stopTalking);
-talk.addEventListener("pointerleave", stopTalking);
+
+// Экран не гаснет, пока страница открыта. Нужно, если телефон живёт
+// в розетке и работает колонкой. Работает только на защищённом
+// соединении, поэтому молча пропускаем, если нельзя.
+async function keepAwake() {
+  try {
+    await navigator.wakeLock.request("screen");
+  } catch (error) {
+    /* не вышло - значит экран гасится как обычно */
+  }
+}
+keepAwake();
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") keepAwake();
+});
 </script>
 </body>
 </html>
