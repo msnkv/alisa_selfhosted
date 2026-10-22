@@ -61,6 +61,15 @@ class Assistant:
         # перестанем его посылать, чтобы не ловить ошибку на каждом вопросе.
         self._thinking_supported = True
 
+        # Последние реплики диалога. Нужны, чтобы работали уточнения:
+        # ассистент сам предлагает «рассказать по шагам?», и без памяти
+        # ответ «да, расскажи» уходит в пустоту - модель не знает, о чём
+        # речь, и берёт первое похожее из data/.
+        # Храним только текст, без вызовов инструментов: результаты поиска
+        # в истории не нужны, а DeepSeek после вызова инструмента требует
+        # возвращать ему и служебные поля - лишний повод для ошибок.
+        self.history: list[dict] = []
+
         self.tools: SearchTools | None = None
         if cfg.search.enabled:
             backend = make_backend(
@@ -120,8 +129,11 @@ class Assistant:
             knowledge=self.knowledge.text(),
             tools_available=self.tools is not None,
         )
+        # История идёт после системного промпта - значит большой неизменный
+        # блок с данными из data/ по-прежнему кэшируется целиком.
         messages: list[dict] = [
             {"role": "system", "content": system},
+            *self.history,
             {"role": "user", "content": question},
         ]
 
@@ -146,10 +158,12 @@ class Assistant:
 
             calls = getattr(message, "tool_calls", None)
             if not calls:
-                return self._finish(
+                answer = self._finish(
                     message.content or "", started, totals, step,
                     tools_used, search_empty,
                 )
+                self._remember(question, answer.text)
+                return answer
 
             if last_step:
                 # Сюда попасть не должны (инструментов не давали), но если
@@ -182,6 +196,25 @@ class Assistant:
         return self._finish(
             GAVE_UP, started, totals, step, tools_used, search_empty
         )
+
+    # --- память диалога ---------------------------------------------------
+
+    def _remember(self, question: str, answer: str) -> None:
+        if self.cfg.agent.memory_turns <= 0 or not answer:
+            return
+        self.history.append({"role": "user", "content": question})
+        self.history.append({"role": "assistant", "content": answer})
+        # Держим только последние пары вопрос-ответ: ассистент отвечает
+        # короткими фразами, дальше в прошлое помнить нечего, а каждая
+        # лишняя реплика - это токены и шанс, что модель зацепится
+        # за старую тему вместо новой.
+        limit = self.cfg.agent.memory_turns * 2
+        if len(self.history) > limit:
+            del self.history[:-limit]
+
+    def forget(self) -> None:
+        """Забыть диалог. Нужно между независимыми вопросами в тестах."""
+        self.history.clear()
 
     # --- внутренности -----------------------------------------------------
 

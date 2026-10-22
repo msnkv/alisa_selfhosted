@@ -97,40 +97,54 @@ def evaluate(case: dict, answer: Answer, max_words: int) -> tuple[list[str], lis
     return failures, warnings
 
 
+def _ask_one(
+    assistant: Assistant, case: dict, kind: str, label: str
+) -> Outcome:
+    try:
+        answer = assistant.ask(case["ask"])
+    except Exception as exc:  # noqa: BLE001
+        return Outcome(
+            ask=label,
+            kind=kind,
+            answer=Answer(text="", seconds=0.0),
+            failures=[f"упало: {type(exc).__name__}: {exc}"],
+            warnings=[],
+        )
+
+    failures, warnings = evaluate(case, answer, assistant.cfg.max_words)
+    return Outcome(
+        ask=label, kind=kind, answer=answer, failures=failures, warnings=warnings
+    )
+
+
 def run(cases: list[dict], assistant: Assistant, repeat: int) -> list[Outcome]:
     outcomes: list[Outcome] = []
-    total = len(cases) * repeat
+    total = sum(1 + len(case.get("then", [])) for case in cases) * repeat
     done = 0
 
     for case in cases:
+        kind = case.get("type", "?")
         for _ in range(repeat):
+            # Вопросы в наборе независимы, поэтому разговор начинаем
+            # с чистого листа. А вот уточнения внутри одного вопроса
+            # идут без сброса - в этом и смысл их проверки.
+            assistant.forget()
+
             done += 1
             print(f"[{done}/{total}] {case['ask']}", flush=True)
-            try:
-                answer = assistant.ask(case["ask"])
-            except Exception as exc:  # noqa: BLE001
-                answer = Answer(text="", seconds=0.0)
+            outcomes.append(_ask_one(assistant, case, kind, case["ask"]))
+
+            for follow_up in case.get("then", []):
+                done += 1
+                print(f"[{done}/{total}]   -> {follow_up['ask']}", flush=True)
                 outcomes.append(
-                    Outcome(
-                        ask=case["ask"],
-                        kind=case.get("type", "?"),
-                        answer=answer,
-                        failures=[f"упало: {type(exc).__name__}: {exc}"],
-                        warnings=[],
+                    _ask_one(
+                        assistant,
+                        follow_up,
+                        kind,
+                        f"-> {follow_up['ask']}",
                     )
                 )
-                continue
-
-            failures, warnings = evaluate(case, answer, assistant.cfg.max_words)
-            outcomes.append(
-                Outcome(
-                    ask=case["ask"],
-                    kind=case.get("type", "?"),
-                    answer=answer,
-                    failures=failures,
-                    warnings=warnings,
-                )
-            )
     return outcomes
 
 

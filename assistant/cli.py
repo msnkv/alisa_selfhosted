@@ -17,10 +17,15 @@ from dataclasses import replace
 
 from .config import ROOT, load_config, setup_logging
 from .llm import Answer, Assistant
+from .mic import make_microphone
 from .prompt import build_system_prompt, human_now
+from .stt import make_stt
 from .tts import SAMPLE_TEXT, SPEAKERS, describe_devices, make_tts
+from .voice import VoiceLoop
 
 EXIT_WORDS = {"выход", "exit", "quit", "q"}
+# Сменить тему, не перезапуская ассистента.
+FORGET_WORDS = {"забудь", "сброс", "новая тема"}
 SAMPLES_DIR = ROOT / "samples"
 
 
@@ -78,6 +83,14 @@ def selftest(assistant: Assistant, tts) -> int:
         print(
             f"  озвучка:     {cfg.tts.engine} {cfg.tts.model},"
             f" голос {cfg.tts.speaker}, {cfg.tts.sample_rate} Гц, {cfg.tts.device}"
+        )
+
+    if not cfg.stt.enabled:
+        print("  слух:        выключен в config.yaml")
+    else:
+        print(
+            f"  слух:        {cfg.stt.engine} {cfg.stt.model},"
+            f" {cfg.stt.device}/{cfg.stt.compute_type}, язык {cfg.stt.language}"
         )
 
     key = cfg.llm.api_key
@@ -142,6 +155,24 @@ def selftest(assistant: Assistant, tts) -> int:
             return 1
         print(f"  модель загружена и синтез работает, {elapsed:.1f} с на прогрев")
 
+    if cfg.stt.enabled:
+        print("\nПробую распознавание (первый раз качает модель, это небыстро)...")
+        stt = make_stt(cfg)
+        try:
+            elapsed = stt.warm_up()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ОШИБКА: {type(exc).__name__}: {exc}")
+            return 1
+        print(
+            f"  работает на {stt.actual_device}/{stt.actual_compute_type},"
+            f" {elapsed:.1f} с на прогрев"
+        )
+        if stt.actual_device != cfg.stt.device:
+            print(
+                f"  ВНИМАНИЕ: просили {cfg.stt.device}, получили"
+                f" {stt.actual_device} — подробности в логе"
+            )
+
     print("\nВсё работает.")
     return 0
 
@@ -153,6 +184,29 @@ def list_devices() -> int:
         "\nНомер нужного устройства впиши в config.yaml:"
         "\n  tts.output_device - куда играть"
     )
+    return 0
+
+
+def check_microphone(cfg) -> int:
+    """Отдельная проверка микрофона, без распознавания.
+
+    Если тут нули, дело в устройстве или в системных настройках, и лезть
+    в распознавание бессмысленно.
+    """
+    microphone = make_microphone(cfg)
+    print("Скажи что-нибудь, слушаю три секунды...")
+    rms, peak = microphone.measure_level(3.0)
+    print(f"  средняя громкость: {rms:.4f}")
+    print(f"  максимум:          {peak:.4f}")
+
+    if peak < 0.001:
+        print("\nМикрофон молчит. Проверь, что он не выключен в системе")
+        print("и что выбрано нужное устройство (--devices, потом mic.input_device).")
+        return 1
+    if peak < 0.02:
+        print("\nСлышно очень тихо — подними громкость микрофона в системе.")
+        return 1
+    print("\nМикрофон слышит нормально.")
     return 0
 
 
@@ -211,6 +265,12 @@ def repl(assistant: Assistant, tts) -> int:
         if not question or question.lower() in EXIT_WORDS:
             return 0
 
+        if question.lower() in FORGET_WORDS:
+            assistant.forget()
+            print("  разговор забыт")
+            print()
+            continue
+
         _respond(assistant, tts, question)
         print()
 
@@ -236,6 +296,12 @@ def main() -> int:
     parser.add_argument(
         "--devices", action="store_true", help="показать аудиоустройства с номерами"
     )
+    parser.add_argument(
+        "--voice", action="store_true", help="голосовой режим: Enter, вопрос, ответ голосом"
+    )
+    parser.add_argument(
+        "--mic", action="store_true", help="проверить микрофон: показать громкость"
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -253,7 +319,17 @@ def main() -> int:
     if args.voices:
         return render_voices(tts, args.voices)
 
+    if args.mic:
+        return check_microphone(cfg)
+
     assistant = Assistant(cfg)
+
+    if args.voice:
+        if tts is None or not cfg.stt.enabled:
+            print("Для голосового режима нужны включённые stt и tts в config.yaml")
+            return 1
+        loop = VoiceLoop(cfg, assistant, make_stt(cfg), tts, make_microphone(cfg))
+        return loop.run()
 
     if args.selftest:
         return selftest(assistant, tts)

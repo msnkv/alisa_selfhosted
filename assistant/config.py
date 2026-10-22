@@ -42,6 +42,7 @@ class SearchConfig:
 class AgentConfig:
     max_steps: int
     total_timeout_s: float
+    memory_turns: int
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,28 @@ class TTSConfig:
 
 
 @dataclass(frozen=True)
+class STTConfig:
+    enabled: bool
+    engine: str
+    model: str
+    device: str
+    compute_type: str
+    language: str
+    beam_size: int
+    vad_filter: bool
+
+
+@dataclass(frozen=True)
+class MicConfig:
+    input_device: int | str | None
+    speech_threshold: float
+    silence_s: float
+    min_speech_s: float
+    max_phrase_s: float
+    wait_speech_s: float
+
+
+@dataclass(frozen=True)
 class Config:
     name: str
     owner: str
@@ -63,6 +86,8 @@ class Config:
     search: SearchConfig
     agent: AgentConfig
     tts: TTSConfig
+    stt: STTConfig
+    mic: MicConfig
     max_sentences: int
     max_words: int
     data_dir: Path
@@ -82,6 +107,8 @@ def load_config(path: Path | None = None) -> Config:
     search = raw.get("search", {})
     agent = raw.get("agent", {})
     tts = raw.get("tts", {})
+    stt = raw.get("stt", {})
+    mic = raw.get("mic", {})
 
     return Config(
         name=raw["assistant"]["name"],
@@ -111,6 +138,7 @@ def load_config(path: Path | None = None) -> Config:
         agent=AgentConfig(
             max_steps=int(agent.get("max_steps", 4)),
             total_timeout_s=float(agent.get("total_timeout_s", 35)),
+            memory_turns=int(agent.get("memory_turns", 3)),
         ),
         tts=TTSConfig(
             enabled=bool(tts.get("enabled", True)),
@@ -120,6 +148,24 @@ def load_config(path: Path | None = None) -> Config:
             sample_rate=int(tts.get("sample_rate", 48000)),
             device=tts.get("device", "cpu"),
             output_device=tts.get("output_device"),
+        ),
+        stt=STTConfig(
+            enabled=bool(stt.get("enabled", True)),
+            engine=stt.get("engine", "faster-whisper"),
+            model=stt.get("model", "large-v3-turbo"),
+            device=stt.get("device", "cuda"),
+            compute_type=stt.get("compute_type", "int8_float16"),
+            language=stt.get("language", "ru"),
+            beam_size=int(stt.get("beam_size", 1)),
+            vad_filter=bool(stt.get("vad_filter", True)),
+        ),
+        mic=MicConfig(
+            input_device=mic.get("input_device"),
+            speech_threshold=float(mic.get("speech_threshold", 0.5)),
+            silence_s=float(mic.get("silence_s", 0.8)),
+            min_speech_s=float(mic.get("min_speech_s", 0.3)),
+            max_phrase_s=float(mic.get("max_phrase_s", 15)),
+            wait_speech_s=float(mic.get("wait_speech_s", 6)),
         ),
         max_sentences=int(raw["answer"]["max_sentences"]),
         max_words=int(raw["answer"].get("max_words", 45)),

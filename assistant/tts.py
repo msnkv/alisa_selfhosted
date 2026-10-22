@@ -157,6 +157,26 @@ class SileroTTS:
         sd.play(samples, samplerate=self.sample_rate, device=self.output_device)
         sd.wait()
 
+    def play_async(self, samples: np.ndarray) -> None:
+        """Запускает воспроизведение и сразу возвращает управление.
+
+        Нужно для фразы-заглушки: пока она звучит, ассистент уже должен
+        искать. Если ждать её конца, заглушка сама добавит полторы секунды
+        к задержке, от которой мы ею же и спасаемся.
+        """
+        import sounddevice as sd
+
+        sd.play(samples, samplerate=self.sample_rate, device=self.output_device)
+
+    def stop(self) -> None:
+        """Обрывает то, что играет сейчас.
+
+        Готовый ответ важнее недоговорённой заглушки.
+        """
+        import sounddevice as sd
+
+        sd.stop()
+
     def save(self, text: str, path: Path, speaker: str | None = None) -> Path:
         import soundfile as sf
 

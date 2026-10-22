@@ -1,3 +1,8 @@
+# Установка с нуля:
+#   py -3.10 -m venv .venv
+#   .venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+
 # --- Шаг 1: мозг и текстовый режим ---
 openai==3.36.1         # OpenAI-совместимый клиент, им же говорим с DeepSeek
 pyyaml==6.0.3          # config.yaml
@@ -8,16 +13,23 @@ ddgs==9.16.0           # поиск: опрашивает несколько п�
 trafilatura==2.3.1     # вытаскивает читаемый текст из html, включая таблицы
 
 # --- Шаг 4: голос ассистента ---
-# torch ставится отдельно, только сборка под процессор:
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-# Видеопамять торчу не нужна: распознавание речи на шаге 5 работает
-# через CTranslate2, пусть вся карта достанется ему.
-torch==2.14.1+cpu
+# torch ставится отдельной командой (см. выше), только сборка под процессор.
+# Видеопамять торчу не нужна: распознавание работает через CTranslate2,
+# пусть вся карта достанется ему. Заодно снимается вопрос Blackwell.
 omegaconf==2.4.0       # нужен загрузчику моделей Silero
-sounddevice==0.5.6     # вывод в наушники, на шаге 5 ещё и микрофон
+sounddevice==0.5.6     # вывод в наушники и запись с микрофона
 soundfile==0.14.0      # сохранение образцов голосов в wav
 numpy==2.2.6
 
-# --- Шаги 5-6: уши ---
-# faster-whisper  # распознавание речи
-# openwakeword    # wake word
+# --- Шаг 5: уши ---
+faster-whisper==1.2.1  # распознавание речи через CTranslate2
+# ctranslate2 не ниже 4.7: в более старых int8 падал на Blackwell (sm_120)
+ctranslate2==4.8.3
+# cuDNN и cuBLAS пакетами, чтобы не ставить CUDA Toolkit целиком.
+# Их dll лежат внутри site-packages, и Windows их сама не находит -
+# каталоги регистрирует _register_cuda_dlls в assistant/stt.py
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# --- Шаг 6: wake word ---
+# openwakeword
