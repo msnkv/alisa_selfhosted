@@ -17,6 +17,7 @@ from typing import Callable
 from openai import APIStatusError, OpenAI
 
 from .config import Config
+from .history import DialogueLog, looks_like_complaint
 from .prompt import (
     Knowledge,
     build_system_prompt,
@@ -140,6 +141,14 @@ class Assistant:
         # «забудь». Повторять фразу перед каждой репликой было бы странно.
         self.long_form = False
 
+        # Журнал диалогов: по строке JSON на обмен, для разбора потом.
+        # Пишется здесь, а не в голосовом цикле, намеренно: через ask
+        # проходят все пути - текстовый режим, голос, сервер со
+        # спутником и страница с телефона. Один вход, один журнал.
+        self.dialogue = DialogueLog(
+            cfg.log_dir / cfg.dialogue_file, enabled=cfg.dialogue_log
+        )
+
         self.tools: SearchTools | None = None
         if cfg.search.enabled:
             backend = make_backend(
@@ -251,6 +260,7 @@ class Assistant:
             knowledge=knowledge,
             tools_available=self.tools is not None,
             city=self.cfg.city,
+            persona=self.cfg.persona,
             detail_words=detail_words,
             mode=mode,
             story_words=story_words,
@@ -304,6 +314,7 @@ class Assistant:
                     content, started, totals, step, tools_used, search_empty,
                 )
                 self._remember(question, answer.text)
+                self._log_turn(question, answer, mode, detail, long_form)
                 return answer
 
             if last_step:
@@ -334,8 +345,44 @@ class Assistant:
                     self.cfg.agent.total_timeout_s, step,
                 )
 
-        return self._finish(
+        answer = self._finish(
             GAVE_UP, started, totals, step, tools_used, search_empty
+        )
+        self._log_turn(question, answer, mode, detail, long_form)
+        return answer
+
+    # --- журнал диалогов --------------------------------------------------
+
+    def _log_turn(
+        self,
+        question: str,
+        answer: Answer,
+        mode: str | None,
+        detail: bool,
+        long_form: bool,
+    ) -> None:
+        """Складывает обмен в журнал. Схему не ломать, см. history.py."""
+        self.dialogue.append(
+            {
+                "question": question,
+                "answer": answer.text,
+                # Пометка «предыдущий ответ не устроил». Нужна не
+                # ассистенту, а тому, кто потом будет разбирать журнал:
+                # именно эти места говорят, как надо было ответить.
+                "complaint": looks_like_complaint(question),
+                "seconds": round(answer.seconds, 2),
+                "steps": answer.steps,
+                "tools": answer.tools_used,
+                "search_empty": answer.search_empty,
+                "mode": mode,
+                "detail": detail,
+                "long_form": long_form,
+                "tokens_in": answer.tokens_in,
+                "tokens_cached": answer.tokens_cached,
+                "tokens_out": answer.tokens_out,
+                "model": self.cfg.llm.model,
+                "data_files": [p.name for p in self.knowledge.files()],
+            }
         )
 
     # --- память диалога ---------------------------------------------------
@@ -358,6 +405,8 @@ class Assistant:
         self.history.clear()
         # Разговор тоже заканчивается: «забудь» — это сброс всего.
         self.long_form = False
+        # И в журнале дальше идёт уже другая беседа.
+        self.dialogue.new_conversation()
 
     def will_be_long_form(self, question: str) -> bool:
         """Будет ли ответ разговором — ещё до обращения к модели.

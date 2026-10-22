@@ -108,6 +108,7 @@ class Config:
     name: str
     owner: str
     city: str
+    persona: str
     llm: LLMConfig
     search: SearchConfig
     agent: AgentConfig
@@ -125,6 +126,8 @@ class Config:
     models_dir: Path
     log_dir: Path
     log_level: str
+    dialogue_log: bool
+    dialogue_file: str
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -147,6 +150,7 @@ def load_config(path: Path | None = None) -> Config:
         name=raw["assistant"]["name"],
         owner=raw["assistant"]["owner"],
         city=str(raw["assistant"].get("city", "") or ""),
+        persona=str(raw["assistant"].get("persona", "") or ""),
         llm=LLMConfig(
             model=llm["model"],
             base_url=llm["base_url"],
@@ -235,6 +239,8 @@ def load_config(path: Path | None = None) -> Config:
         models_dir=ROOT / raw.get("models", {}).get("dir", "models"),
         log_dir=ROOT / raw["logging"]["dir"],
         log_level=raw["logging"]["level"].upper(),
+        dialogue_log=bool(raw["logging"].get("dialogue", True)),
+        dialogue_file=str(raw["logging"].get("dialogue_file", "dialogue.jsonl")),
     )
 
 

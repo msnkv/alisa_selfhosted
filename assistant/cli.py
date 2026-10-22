@@ -19,6 +19,7 @@ from dataclasses import replace
 from .config import ROOT, load_config, setup_logging
 from .llm import Answer, Assistant
 from .mic import make_microphone
+from .history import describe as describe_dialogue
 from .prompt import build_system_prompt, human_now, is_forget
 from .stt import make_stt
 from .tts import SAMPLE_TEXT, SPEAKERS, SpeechQueue, describe_devices, make_tts
@@ -365,6 +366,10 @@ def main() -> int:
         help="показать уверенность модели кодовой фразы, чтобы подобрать порог",
     )
     parser.add_argument(
+        "--history", nargs="?", const=5, type=int, metavar="СКОЛЬКО",
+        help="сводка по журналу диалогов и последние обмены",
+    )
+    parser.add_argument(
         "--serve", action="store_true",
         help="отвечать на вопросы по домашней сети (для спутника и телефона)",
     )
@@ -379,6 +384,10 @@ def main() -> int:
 
     if args.devices:
         return list_devices()
+
+    if args.history is not None:
+        print(describe_dialogue(cfg.log_dir / cfg.dialogue_file, last=args.history))
+        return 0
 
     if args.no_web:
         cfg = replace(cfg, search=replace(cfg.search, enabled=False))
