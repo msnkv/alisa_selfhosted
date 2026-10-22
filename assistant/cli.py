@@ -251,6 +251,11 @@ def _respond(assistant: Assistant, tts, question: str) -> Answer | None:
     # ровно то, что услышишь из колонки, и видно замер до первого звука.
     speech = None
     if tts is not None and assistant.cfg.tts.stream:
+        # Прогрев обязателен до вопроса, а не после. Иначе синтез первого
+        # предложения ждёт загрузки модели - это секунды, и весь смысл
+        # потоковой озвучки пропадает именно в том замере, который мы тут
+        # и печатаем.
+        tts.warm_up()
         speech = SpeechQueue(tts)
         speech.start()
 
@@ -271,10 +276,12 @@ def _respond(assistant: Assistant, tts, question: str) -> Answer | None:
     print(_stats(answer))
 
     if speech is not None:
-        if speech.first_sound_at is not None:
-            print(f"  [до первого звука {speech.first_sound_at - started:.2f} с]")
+        # Сначала дать договорить, потом печатать замер: до этого момента
+        # первого звука могло ещё не случиться.
         speech.close()
         speech.wait()
+        if speech.first_sound_at is not None:
+            print(f"  [до первого звука {speech.first_sound_at - started:.2f} с]")
     elif tts is not None:
         try:
             tts.say(answer.text)
