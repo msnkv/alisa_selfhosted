@@ -123,7 +123,9 @@ class Microphone:
         self.vad.probability(np.zeros(FRAME, dtype=np.float32))
         return time.perf_counter() - started
 
-    def record_phrase(self, *, on_speech_start=None) -> np.ndarray:
+    def record_phrase(
+        self, *, on_speech_start=None, wait_speech_s: float | None = None
+    ) -> np.ndarray:
         """Пишет с микрофона, пока человек не договорит.
 
         Возвращает запись целиком, включая тишину в начале: обрезать её
@@ -132,6 +134,12 @@ class Microphone:
         """
         import sounddevice as sd
 
+        # Для уточнения без кодовой фразы ждать нужно меньше, чем на
+        # обычном круге: если человек молчит, надо быстро вернуться к
+        # ожиданию кодовой фразы, а не висеть с открытым микрофоном.
+        wait_for_speech = (
+            self.wait_speech_s if wait_speech_s is None else wait_speech_s
+        )
         self.vad.reset()
         chunks: queue.Queue[np.ndarray] = queue.Queue()
 
@@ -180,8 +188,8 @@ class Microphone:
                 if heard_speech and elapsed >= self.max_phrase_s:
                     log.info("фраза оборвана по лимиту %.0f с", self.max_phrase_s)
                     break
-                if not heard_speech and elapsed >= self.wait_speech_s:
-                    log.info("речи не услышал за %.0f с", self.wait_speech_s)
+                if not heard_speech and elapsed >= wait_for_speech:
+                    log.info("речи не услышал за %.0f с", wait_for_speech)
                     return np.zeros(0, dtype=np.float32)
 
         audio = np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32)

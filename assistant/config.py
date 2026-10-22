@@ -79,6 +79,7 @@ class WakeConfig:
     vad_threshold: float
     input_device: int | str | None
     cooldown_s: float
+    follow_up_s: float
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,7 @@ def load_config(path: Path | None = None) -> Config:
             vad_threshold=float(wake.get("vad_threshold", 0.5)),
             input_device=wake.get("input_device"),
             cooldown_s=float(wake.get("cooldown_s", 1.0)),
+            follow_up_s=float(wake.get("follow_up_s", 8.0)),
         ),
         max_sentences=int(raw["answer"]["max_sentences"]),
         max_words=int(raw["answer"].get("max_words", 45)),

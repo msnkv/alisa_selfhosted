@@ -17,7 +17,12 @@ from typing import Callable
 from openai import APIStatusError, OpenAI
 
 from .config import Config
-from .prompt import Knowledge, build_system_prompt, clean_for_speech
+from .prompt import (
+    Knowledge,
+    build_system_prompt,
+    clean_for_speech,
+    looks_like_tool_markup,
+)
 from .search import EMPTY_RESULT_MARKER, SearchTools, make_backend
 
 log = logging.getLogger(__name__)
@@ -84,6 +89,17 @@ class _StreamedCall:
     @property
     def function(self) -> "_StreamedCall":
         return self
+
+
+# На последнем шаге инструменты у модели забирают, но системный промпт
+# по-прежнему требует «обязательно вызови поиск». Из этого противоречия
+# она пытается вызвать инструмент текстом. Поэтому на последнем шаге
+# говорим прямо: искать больше нечем, отвечай словами.
+LAST_STEP_NUDGE = (
+    "Инструментов больше нет, искать нечем. Ответь словами по тому, что "
+    "уже нашла. Если надёжного ответа нет — честно скажи, что проверить "
+    "не удалось. Никакой разметки и никаких вызовов инструментов в ответе."
+)
 
 
 # Что сказать, если инструменты отработали, а ответа всё равно нет.
@@ -195,6 +211,7 @@ class Assistant:
         totals = {"in": 0, "out": 0, "cached": 0}
         tools_used: list[str] = []
         search_empty = False
+        nudged = False
         step = 0
 
         while True:
@@ -204,6 +221,12 @@ class Assistant:
             # На последнем шаге инструменты не даём: модель обязана ответить
             # словами, иначе цикл не закончится никогда.
             tools = None if (last_step or self.tools is None) else self.tools.SCHEMAS
+            if last_step and tools_used and not nudged:
+                # Инструменты уже отработали, а теперь их отобрали -
+                # надо сказать об этом прямо, иначе модель выдаст вызов
+                # текстом. Сообщение идёт в конец, кэш промпта не рвётся.
+                messages.append({"role": "user", "content": LAST_STEP_NUDGE})
+                nudged = True
 
             content, calls, usage = self._step(messages, tools, on_sentence)
             self._add_usage(totals, usage)
@@ -340,6 +363,9 @@ class Assistant:
         buffer = ""
         calls: dict[int, _StreamedCall] = {}
         usage = None
+        # Если в тексте пошла служебная разметка - это не ответ, а
+        # попытка вызвать инструмент. Озвучивать такое нельзя.
+        muted = False
 
         for chunk in stream:
             if getattr(chunk, "usage", None) is not None:
@@ -366,13 +392,18 @@ class Assistant:
                 continue
             pieces.append(text)
             buffer += text
+            if not muted and looks_like_tool_markup(buffer):
+                log.warning("модель выдаёт вызов инструмента текстом, молчу")
+                muted = True
+            if muted:
+                continue
             ready, buffer = split_sentences(buffer)
             for sentence in ready:
                 on_sentence(sentence)
 
         # Последнее предложение обычно без пробела на конце, поэтому
         # разбивка его не отдаёт - отдаём здесь.
-        tail = clean_for_speech(buffer)
+        tail = "" if muted else clean_for_speech(buffer)
         if tail:
             on_sentence(tail)
 
@@ -426,6 +457,11 @@ class Assistant:
         tools_used: list[str],
         search_empty: bool = False,
     ) -> Answer:
+        if looks_like_tool_markup(text):
+            # Не ответ, а вызов инструмента текстом. Лучше честное
+            # «не нашла», чем зачитанная вслух разметка.
+            log.warning("вместо ответа пришла разметка вызова: %s", text[:200])
+            text = ""
         answer = Answer(
             text=clean_for_speech(text) or GAVE_UP,
             seconds=time.perf_counter() - started,

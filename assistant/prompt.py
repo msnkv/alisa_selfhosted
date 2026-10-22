@@ -149,6 +149,18 @@ _MARKUP = re.compile(r"[*_`#]+")
 _LIST_BULLET = re.compile(r"^\s*[-•–—]\s+", re.MULTILINE)
 
 
+# DeepSeek иногда пытается вызвать инструмент и на том шаге, где
+# инструментов ему не дали. Вызов тогда приезжает не вызовом, а текстом
+# в его служебной разметке — и без этой проверки уходит прямо в синтез.
+# Слышно это было как бессвязный набор слов вместо ответа.
+_TOOL_MARKUP = re.compile(r"DSML|invoke\s+name=|<\s*/?\s*(?:tool_call|function)\b")
+
+
+def looks_like_tool_markup(text: str) -> bool:
+    """Это не ответ, а попытка вызвать инструмент текстом."""
+    return bool(_TOOL_MARKUP.search(text or ""))
+
+
 def clean_for_speech(text: str) -> str:
     text = _MARKUP.sub("", text)
     text = _LIST_BULLET.sub("", text)

@@ -189,20 +189,27 @@ class SileroTTS:
 
 
 class SpeechQueue:
-    """Говорит ответ по предложениям, пока модель его ещё дописывает.
+    """Единственный канал звука на один круг разговора.
 
-    Зачем: раньше ассистент молчал всё время генерации, потом синтезировал
-    ответ целиком и только тогда начинал говорить. Для вопросов по данным
-    это две-три секунды тишины, для вопросов с поиском — больше.
+    Через неё проходит всё, что ассистент произносит: и фраза-заглушка,
+    и предложения ответа по мере генерации. Это не удобство, а
+    необходимость, и причина дорогая.
 
-    Потоков два, а не один, и это главное: синтезатор готовит следующее
-    предложение, пока динамик играет текущее. Синтез быстрее реального
-    времени примерно в пятнадцать раз, поэтому после первого предложения
-    речь идёт без разрывов, а ждать приходится только его одно.
+    `sounddevice` держит один поток вывода в своей глобальной переменной:
+    каждый `sd.play` останавливает предыдущий и записывает туда себя.
+    Пока заглушка играла из главного потока, а ответ — из потока
+    воспроизведения, два вызова дрались за эту переменную. Выигрывали
+    оба: живыми оставались два потока вывода, а библиотека знала про
+    один. В комнате это звучало как два разных ответа одновременно.
+    Поэтому `sd.play` вызывает ровно один поток — `_play_loop`, и
+    никто больше.
 
-    Порядок гарантируют обычные очереди: предложения проходят через
-    синтез и воспроизведение строго по одному, в том порядке, в котором
-    их отдала модель.
+    Потоков синтеза и воспроизведения два, а не один: пока динамик
+    играет текущее предложение, синтезатор готовит следующее. Синтез
+    быстрее реального времени примерно в пятнадцать раз, поэтому после
+    первой фразы речь идёт без разрывов. Порядок гарантирует одна
+    очередь на входе: готовая заглушка и ещё не синтезированные
+    предложения лежат в ней вместе и проходят дальше строго по одному.
     """
 
     def __init__(self, tts: SileroTTS) -> None:
@@ -212,11 +219,23 @@ class SpeechQueue:
         self._synth: threading.Thread | None = None
         self._player: threading.Thread | None = None
         self._stopped = threading.Event()
-        # Момент, когда из динамика пошёл первый звук. Это и есть та
-        # задержка, которую человек ощущает; замеряем её прямо здесь,
-        # а не складываем из частей.
+        # Момент, когда из динамика пошёл первый звук ОТВЕТА. Заглушка
+        # не считается: она для того и нужна, чтобы звучать раньше него.
         self.first_sound_at: float | None = None
+        # Сколько всего поставлено в очередь. По этому счётчику голосовой
+        # цикл решает, нужна ли заглушка вообще: если модель уже что-то
+        # сказала, заглушка будет лишней болтовнёй поверх её слов.
+        self.added = 0
         self.spoken: list[str] = []
+
+    @property
+    def pending(self) -> int:
+        """Сколько фраз ещё не договорено: в синтезе или в динамике.
+
+        По нему голосовой цикл решает, свободен ли канал. Ноль означает
+        тишину - и только тогда имеет смысл сказать заглушку.
+        """
+        return max(0, self.added - len(self.spoken))
 
     def start(self) -> None:
         self._synth = threading.Thread(
@@ -228,13 +247,27 @@ class SpeechQueue:
         self._synth.start()
         self._player.start()
 
-    def add(self, sentence: str) -> None:
+    def add(self, sentence: str, *, kind: str = "answer") -> None:
         """Отдать очередное предложение в синтез."""
         if self._stopped.is_set():
             return
         sentence = sentence.strip()
-        if sentence:
-            self._texts.put(sentence)
+        if not sentence:
+            return
+        self.added += 1
+        self._texts.put((kind, sentence))
+
+    def add_audio(self, samples, *, kind: str = "filler") -> None:
+        """Поставить в очередь уже синтезированное.
+
+        Заглушка синтезируется один раз при прогреве, гонять её через
+        синтез заново незачем. Но в очередь она идёт в ту же самую,
+        иначе порядок перестанет быть порядком.
+        """
+        if self._stopped.is_set() or samples is None or len(samples) == 0:
+            return
+        self.added += 1
+        self._texts.put((kind, samples))
 
     def close(self) -> None:
         """Предложений больше не будет; дать потокам договорить."""
@@ -258,36 +291,40 @@ class SpeechQueue:
 
     def _synth_loop(self) -> None:
         while True:
-            sentence = self._texts.get()
-            if sentence is None or self._stopped.is_set():
+            item = self._texts.get()
+            if item is None or self._stopped.is_set():
                 # None дальше по цепочке: он скажет динамику, что всё.
                 self._audio.put(None)
                 return
+            kind, payload = item
+            if isinstance(payload, np.ndarray):
+                self._audio.put((kind, "(готовая фраза)", payload))
+                continue
             try:
-                samples = self.tts.synthesize(sentence)
+                samples = self.tts.synthesize(payload)
             except Exception as exc:  # noqa: BLE001
                 # Одно неудачное предложение не должно рушить весь ответ:
                 # остальные скажем, а причину оставим в логе.
-                log.warning("не синтезировала «%s»: %s", sentence, exc)
+                log.warning("не синтезировала «%s»: %s", payload, exc)
                 continue
             if len(samples):
-                self._audio.put((sentence, samples))
+                self._audio.put((kind, payload, samples))
 
     def _play_loop(self) -> None:
         import sounddevice as sd
 
-        first = True
+        opened = False
         while True:
             item = self._audio.get()
             if item is None or self._stopped.is_set():
                 return
-            sentence, samples = item
-            if first:
-                # Фраза-заглушка «секунду, смотрю» могла ещё звучать —
-                # обрываем её: готовый ответ важнее недоговорённой заглушки.
+            kind, label, samples = item
+            if not opened:
+                # Отзыв «да?» мог ещё звучать — обрываем его.
                 sd.stop()
+                opened = True
+            if kind == "answer" and self.first_sound_at is None:
                 self.first_sound_at = time.perf_counter()
-                first = False
             try:
                 sd.play(
                     samples,
@@ -296,8 +333,8 @@ class SpeechQueue:
                 )
                 sd.wait()
             except Exception as exc:  # noqa: BLE001
-                log.warning("не проиграла «%s»: %s", sentence, exc)
-            self.spoken.append(sentence)
+                log.warning("не проиграла «%s»: %s", label, exc)
+            self.spoken.append(label)
 
 
 ENGINES = {"silero": SileroTTS}

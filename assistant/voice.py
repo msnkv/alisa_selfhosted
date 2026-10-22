@@ -32,6 +32,13 @@ FILLER_PHRASE = "Секунду, смотрю."
 # Отзыв на кодовую фразу: без него непонятно, услышал ассистент или нет.
 ACK_PHRASE = "Да?"
 
+# Как часто можно повторять заглушку. Вопрос с несколькими поисками
+# занимает до тридцати секунд, и одной фразы в начале на это не хватает:
+# дальше идёт полминуты тишины, которая выглядит как поломка. Но и
+# подряд её говорить нельзя - именно это звучало как каша. Поэтому
+# повторяем, только когда канал звука свободен и прошло хотя бы столько.
+FILLER_GAP_S = 8.0
+
 
 @dataclass
 class Timings:
@@ -85,6 +92,11 @@ class VoiceLoop:
         self.wake = wake
         self._filler_audio = None
         self._ack_audio = None
+        # Очередь звука текущего круга. Нужна заглушке: она обязана идти
+        # тем же каналом, что и ответ, иначе два потока дерутся за вывод.
+        self._speech = None
+        # Когда заглушка звучала последний раз - чтобы не частить.
+        self._filler_at = 0.0
 
     # --- подготовка -------------------------------------------------------
 
@@ -123,23 +135,50 @@ class VoiceLoop:
     # --- один круг --------------------------------------------------------
 
     def _say_filler(self, name: str, arguments: dict) -> None:
+        """Сказать «секунду, смотрю», если тишину больше нечем закрыть."""
         detail = arguments.get("query") or arguments.get("url") or ""
         print(f"  ... {name}: {detail}")
         if self._filler_audio is None:
             return
-        try:
-            self.tts.play_async(self._filler_audio)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("заглушка не прозвучала: %s", exc)
 
-    def listen_and_answer(self) -> Timings | None:
-        """Один круг: послушать, распознать, ответить голосом."""
+        speech = self._speech
+        if speech is None:
+            # Непотоковый режим: играть больше нечему, канал свободен.
+            try:
+                self.tts.play_async(self._filler_audio)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("заглушка не прозвучала: %s", exc)
+            return
+
+        # Заглушка нужна ровно для того, чтобы не висела тишина. Значит
+        # говорить её можно только в тишину: если канал занят - молчим.
+        # Это закрывает два случая разом: модель сама что-то сказала
+        # перед вызовом инструмента («сейчас уточню цены»), и несколько
+        # вызовов подряд. Без этой проверки на четырёх вызовах звучало
+        # четыре «секунду, смотрю», в том числе поверх ответа.
+        if speech.pending > 0:
+            return
+        now = time.perf_counter()
+        if now - self._filler_at < FILLER_GAP_S:
+            return
+        self._filler_at = now
+        speech.add_audio(self._filler_audio)
+
+    def listen_and_answer(
+        self, *, wait_speech_s: float | None = None
+    ) -> Timings | None:
+        """Один круг: послушать, распознать, ответить голосом.
+
+        wait_speech_s короче обычного на уточнении без кодовой фразы:
+        там микрофон открыт на всякий случай, и висеть долго незачем.
+        """
         timings = Timings()
 
         print("  слушаю...")
         started = time.perf_counter()
         audio = self.microphone.record_phrase(
-            on_speech_start=lambda: print("  говоришь...")
+            on_speech_start=lambda: print("  говоришь..."),
+            wait_speech_s=wait_speech_s,
         )
         timings.record = time.perf_counter() - started
         # Момент «человек договорил»: от него и считается ожидание в тишине.
@@ -171,22 +210,40 @@ class VoiceLoop:
         # получает предложения по одному и начинает говорить с первого,
         # не дожидаясь конца ответа.
         speech = SpeechQueue(self.tts) if self.cfg.tts.stream else None
+        self._speech = speech
+        self._filler_at = 0.0
         if speech is not None:
             speech.start()
+
+        # Запоминаем всё, что ушло в озвучку: напечатанное должно
+        # совпадать со сказанным, иначе разбирать жалобы невозможно.
+        said: list[str] = []
+
+        def on_sentence(sentence: str) -> None:
+            said.append(sentence)
+            speech.add(sentence)
 
         started = time.perf_counter()
         try:
             answer = self.assistant.ask(
                 transcript.text,
                 on_tool_call=self._say_filler,
-                on_sentence=speech.add if speech is not None else None,
+                on_sentence=on_sentence if speech is not None else None,
             )
         except Exception:
             if speech is not None:
                 speech.stop()
             raise
+        finally:
+            self._speech = None
         timings.llm = time.perf_counter() - started
 
+        # Модель иногда говорит что-то и на шаге с инструментом: «сейчас
+        # уточню цены». В answer.text этого нет - там только последний
+        # шаг, - но прозвучать оно успело, поэтому печатаем отдельно.
+        aside = [phrase for phrase in said if phrase not in answer.text]
+        if aside:
+            print(f"  {self.cfg.name} (по ходу): {' '.join(aside)}")
         print(f"  {self.cfg.name}: {answer.text}")
 
         if speech is not None:
@@ -271,14 +328,25 @@ class VoiceLoop:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("отзыв не прозвучал: %s", exc)
 
-            try:
-                self.listen_and_answer()
-            except KeyboardInterrupt:
-                print()
-                return 0
-            except Exception as exc:  # noqa: BLE001
-                print(f"  ошибка: {type(exc).__name__}: {exc}")
-                log.exception("круг голосового цикла упал")
+            # Первый круг ждёт речь как обычно, уточнения - меньше.
+            # Требовать кодовую фразу перед «да, расскажи подробнее»
+            # бессмысленно: ассистент сам это предложил.
+            wait = None
+            while True:
+                try:
+                    timings = self.listen_and_answer(wait_speech_s=wait)
+                except KeyboardInterrupt:
+                    print()
+                    return 0
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  ошибка: {type(exc).__name__}: {exc}")
+                    log.exception("круг голосового цикла упал")
+                    break
+
+                if timings is None or self.cfg.wake.follow_up_s <= 0:
+                    break
+                wait = self.cfg.wake.follow_up_s
+                print("  (уточняй сразу, без кодовой фразы)")
 
             # Пауза, чтобы ассистент не поймал кодовую фразу в собственном
             # ответе из колонок. С наушниками не нужна, с динамиками важна.
