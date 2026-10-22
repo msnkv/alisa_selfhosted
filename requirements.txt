@@ -32,4 +32,8 @@ nvidia-cublas-cu12
 nvidia-cudnn-cu12
 
 # --- Шаг 6: wake word ---
-# openwakeword
+# На Windows работает только через onnxruntime: tflite не поддерживается,
+# а библиотека по умолчанию просит именно его - см. inference_framework
+# в assistant/wake.py. Модели (~5 МБ) докачиваются при первом запуске
+# в resources/models самого openwakeword, то есть внутрь .venv
+openwakeword==0.6.0

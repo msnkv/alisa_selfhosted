@@ -1,11 +1,12 @@
-"""Голосовой цикл: нажал клавишу, спросил голосом, услышал ответ.
+"""Голосовой цикл. Два режима: по клавише и по кодовой фразе.
 
-Клавиша здесь временная — на шаге 6 её заменит wake word. Но порядок
-именно такой намеренно: с клавишей видно, что всё остальное работает, и
-капризную настройку wake word можно делать на уже говорящем ассистенте.
+Режим с клавишей сделан первым намеренно: он позволил убедиться, что
+распознавание, модель и синтез работают, до того как добавилась капризная
+настройка wake word. Он остаётся в проекте как отладочный — когда wake
+word шалит, удобно проверить всё остальное без него.
 
-Остановку записи клавишей не делаем: в комнате руки заняты, поэтому запись
-обрывается сама, когда человек замолчал (см. mic.py).
+Остановку записи клавишей не делаем ни в одном режиме: в комнате руки
+заняты, поэтому запись обрывается сама, когда человек замолчал (mic.py).
 """
 
 from __future__ import annotations
@@ -22,10 +23,13 @@ log = logging.getLogger(__name__)
 EXIT_WORDS = {"выход", "exit", "quit", "q"}
 FORGET_WORDS = {"забудь", "сброс", "новая тема"}
 
-# Пока ассистент ищет в интернете, проходит от четырёх до двенадцати секунд.
+# Пока ассистент ищет в интернете, проходит от четырёх до шестнадцати секунд.
 # Тишина такой длины из колонки выглядит как «сломалось», поэтому сразу
 # говорим заглушку. Она синтезируется заранее, при прогреве.
 FILLER_PHRASE = "Секунду, смотрю."
+
+# Отзыв на кодовую фразу: без него непонятно, услышал ассистент или нет.
+ACK_PHRASE = "Да?"
 
 
 @dataclass
@@ -58,13 +62,16 @@ class VoiceLoop:
         stt,
         tts,
         microphone,
+        wake=None,
     ) -> None:
         self.cfg = cfg
         self.assistant = assistant
         self.stt = stt
         self.tts = tts
         self.microphone = microphone
+        self.wake = wake
         self._filler_audio = None
+        self._ack_audio = None
 
     # --- подготовка -------------------------------------------------------
 
@@ -89,10 +96,16 @@ class VoiceLoop:
 
         started = time.perf_counter()
         self.tts.warm_up()
-        # Заглушку синтезируем один раз здесь, чтобы в бою она звучала
-        # мгновенно, а не через полсекунды после решения искать.
+        # Заглушку и отзыв синтезируем один раз здесь, чтобы в бою они
+        # звучали мгновенно, а не через полсекунды после события.
         self._filler_audio = self.tts.synthesize(FILLER_PHRASE)
+        self._ack_audio = self.tts.synthesize(ACK_PHRASE)
         print(f"  синтез речи: {time.perf_counter() - started:.1f} с")
+
+        if self.wake is not None:
+            started = time.perf_counter()
+            self.wake.warm_up()
+            print(f"  кодовая фраза: {time.perf_counter() - started:.1f} с")
 
     # --- один круг --------------------------------------------------------
 
@@ -132,6 +145,13 @@ class VoiceLoop:
 
         print(f"\n  ты: {transcript.text}")
 
+        # «Забудь» голосом: сменить тему, не трогая клавиатуру.
+        if transcript.text.strip().lower().rstrip(".!?") in FORGET_WORDS:
+            self.assistant.forget()
+            print("  разговор забыт")
+            self.tts.say("Забыла, слушаю заново.")
+            return None
+
         started = time.perf_counter()
         answer = self.assistant.ask(transcript.text, on_tool_call=self._say_filler)
         timings.llm = time.perf_counter() - started
@@ -150,7 +170,7 @@ class VoiceLoop:
         print(f"  [{timings.describe()}]")
         return timings
 
-    # --- цикл -------------------------------------------------------------
+    # --- режим с клавишей -------------------------------------------------
 
     def run(self) -> int:
         self.warm_up()
@@ -180,4 +200,50 @@ class VoiceLoop:
             except Exception as exc:  # noqa: BLE001
                 print(f"  ошибка: {type(exc).__name__}: {exc}")
                 log.exception("круг голосового цикла упал")
+            print()
+
+    # --- режим с кодовой фразой -------------------------------------------
+
+    def run_wake(self) -> int:
+        if self.wake is None:
+            print("Кодовая фраза выключена в config.yaml")
+            return 1
+
+        self.warm_up()
+        spoken = self.cfg.wake.model.replace("_", " ")
+        print(
+            f"\n{self.cfg.name} ждёт кодовую фразу: «{spoken}»."
+            "\nСкажи её, потом задай вопрос. Ctrl+C — закончить.\n"
+        )
+
+        while True:
+            try:
+                heard = self.wake.wait()
+            except KeyboardInterrupt:
+                print()
+                return 0
+
+            if not heard:
+                continue
+
+            print("  да?")
+            if self._ack_audio is not None:
+                try:
+                    self.tts.play_async(self._ack_audio)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("отзыв не прозвучал: %s", exc)
+
+            try:
+                self.listen_and_answer()
+            except KeyboardInterrupt:
+                print()
+                return 0
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ошибка: {type(exc).__name__}: {exc}")
+                log.exception("круг голосового цикла упал")
+
+            # Пауза, чтобы ассистент не поймал кодовую фразу в собственном
+            # ответе из колонок. С наушниками не нужна, с динамиками важна.
+            if self.cfg.wake.cooldown_s > 0:
+                time.sleep(self.cfg.wake.cooldown_s)
             print()

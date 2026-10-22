@@ -69,6 +69,16 @@ class STTConfig:
 
 
 @dataclass(frozen=True)
+class WakeConfig:
+    enabled: bool
+    model: str
+    threshold: float
+    vad_threshold: float
+    input_device: int | str | None
+    cooldown_s: float
+
+
+@dataclass(frozen=True)
 class MicConfig:
     input_device: int | str | None
     speech_threshold: float
@@ -88,6 +98,7 @@ class Config:
     tts: TTSConfig
     stt: STTConfig
     mic: MicConfig
+    wake: WakeConfig
     max_sentences: int
     max_words: int
     data_dir: Path
@@ -109,6 +120,7 @@ def load_config(path: Path | None = None) -> Config:
     tts = raw.get("tts", {})
     stt = raw.get("stt", {})
     mic = raw.get("mic", {})
+    wake = raw.get("wake", {})
 
     return Config(
         name=raw["assistant"]["name"],
@@ -166,6 +178,14 @@ def load_config(path: Path | None = None) -> Config:
             min_speech_s=float(mic.get("min_speech_s", 0.3)),
             max_phrase_s=float(mic.get("max_phrase_s", 15)),
             wait_speech_s=float(mic.get("wait_speech_s", 6)),
+        ),
+        wake=WakeConfig(
+            enabled=bool(wake.get("enabled", True)),
+            model=wake.get("model", "hey_jarvis"),
+            threshold=float(wake.get("threshold", 0.5)),
+            vad_threshold=float(wake.get("vad_threshold", 0.5)),
+            input_device=wake.get("input_device"),
+            cooldown_s=float(wake.get("cooldown_s", 1.0)),
         ),
         max_sentences=int(raw["answer"]["max_sentences"]),
         max_words=int(raw["answer"].get("max_words", 45)),

@@ -22,6 +22,7 @@ from .prompt import build_system_prompt, human_now
 from .stt import make_stt
 from .tts import SAMPLE_TEXT, SPEAKERS, describe_devices, make_tts
 from .voice import VoiceLoop
+from .wake import make_wake_word
 
 EXIT_WORDS = {"выход", "exit", "quit", "q"}
 # Сменить тему, не перезапуская ассистента.
@@ -84,6 +85,14 @@ def selftest(assistant: Assistant, tts) -> int:
             f"  озвучка:     {cfg.tts.engine} {cfg.tts.model},"
             f" голос {cfg.tts.speaker}, {cfg.tts.sample_rate} Гц, {cfg.tts.device}"
         )
+
+    if cfg.wake.enabled:
+        print(
+            f"  кодовая фраза: {cfg.wake.model} (порог {cfg.wake.threshold},"
+            f" фильтр речи {cfg.wake.vad_threshold})"
+        )
+    else:
+        print("  кодовая фраза: выключена в config.yaml")
 
     if not cfg.stt.enabled:
         print("  слух:        выключен в config.yaml")
@@ -302,6 +311,14 @@ def main() -> int:
     parser.add_argument(
         "--mic", action="store_true", help="проверить микрофон: показать громкость"
     )
+    parser.add_argument(
+        "--wake", action="store_true",
+        help="режим кодовой фразы: ассистент сам просыпается на слово",
+    )
+    parser.add_argument(
+        "--wake-test", action="store_true",
+        help="показать уверенность модели кодовой фразы, чтобы подобрать порог",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -322,14 +339,25 @@ def main() -> int:
     if args.mic:
         return check_microphone(cfg)
 
+    if args.wake_test:
+        # Ни ключа, ни модели тут не нужно - только микрофон и wake word.
+        make_wake_word(cfg).monitor()
+        return 0
+
     assistant = Assistant(cfg)
 
-    if args.voice:
+    if args.voice or args.wake:
         if tts is None or not cfg.stt.enabled:
             print("Для голосового режима нужны включённые stt и tts в config.yaml")
             return 1
-        loop = VoiceLoop(cfg, assistant, make_stt(cfg), tts, make_microphone(cfg))
-        return loop.run()
+        wake = make_wake_word(cfg) if (args.wake and cfg.wake.enabled) else None
+        if args.wake and wake is None:
+            print("Кодовая фраза выключена: поставь wake.enabled в config.yaml")
+            return 1
+        loop = VoiceLoop(
+            cfg, assistant, make_stt(cfg), tts, make_microphone(cfg), wake
+        )
+        return loop.run_wake() if args.wake else loop.run()
 
     if args.selftest:
         return selftest(assistant, tts)
