@@ -234,7 +234,12 @@ class SpeechQueue:
     def __init__(self, tts: SileroTTS) -> None:
         self.tts = tts
         self._texts: queue.Queue = queue.Queue()
-        self._audio: queue.Queue = queue.Queue()
+        # Ограничение не случайное: синтез быстрее реального времени
+        # примерно в пятнадцать раз, и на длинной сказке он успел бы
+        # насинтезировать двадцать минут звука в память, пока играет
+        # первая минута. Это сотни мегабайт. С пределом синтезатор
+        # просто ждёт динамик.
+        self._audio: queue.Queue = queue.Queue(maxsize=4)
         self._synth: threading.Thread | None = None
         self._player: threading.Thread | None = None
         self._stopped = threading.Event()
@@ -293,7 +298,12 @@ class SpeechQueue:
         # Разрешение ставим тоже, иначе динамик навсегда повиснет на нём.
         self._allowed.set()
         self._texts.put(None)
-        self._audio.put(None)
+        # Без ожидания: очередь звука ограничена, и обычный put мог бы
+        # повиснуть именно тогда, когда мы пытаемся всё оборвать.
+        try:
+            self._audio.put_nowait(None)
+        except queue.Full:
+            pass
         sd.stop()
 
     # --- потоки -----------------------------------------------------------

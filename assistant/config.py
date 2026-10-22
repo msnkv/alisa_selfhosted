@@ -21,6 +21,8 @@ class LLMConfig:
     thinking: bool
     temperature: float
     max_tokens: int
+    detail_max_tokens: int
+    story_max_tokens: int
     timeout_s: float
     max_retries: int
     api_key: str
@@ -116,7 +118,10 @@ class Config:
     server: ServerConfig
     max_sentences: int
     max_words: int
+    detail_words: int
+    story_words: int
     data_dir: Path
+    data_only_on_request: bool
     models_dir: Path
     log_dir: Path
     log_level: str
@@ -148,6 +153,8 @@ def load_config(path: Path | None = None) -> Config:
             thinking=bool(llm.get("thinking", False)),
             temperature=float(llm.get("temperature", 0.3)),
             max_tokens=int(llm.get("max_tokens", 400)),
+            detail_max_tokens=int(llm.get("detail_max_tokens", 1400)),
+            story_max_tokens=int(llm.get("story_max_tokens", 6000)),
             timeout_s=float(llm.get("timeout_s", 30)),
             max_retries=int(llm.get("max_retries", 1)),
             # Ключ только из окружения: в config.yaml, который лежит в git,
@@ -221,7 +228,10 @@ def load_config(path: Path | None = None) -> Config:
         ),
         max_sentences=int(raw["answer"]["max_sentences"]),
         max_words=int(raw["answer"].get("max_words", 45)),
+        detail_words=int(raw["answer"].get("detail_words", 300)),
+        story_words=int(raw["answer"].get("story_words", 3000)),
         data_dir=ROOT / raw["data"]["dir"],
+        data_only_on_request=bool(raw["data"].get("only_on_request", False)),
         models_dir=ROOT / raw.get("models", {}).get("dir", "models"),
         log_dir=ROOT / raw["logging"]["dir"],
         log_level=raw["logging"]["level"].upper(),

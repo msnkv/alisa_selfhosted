@@ -267,6 +267,11 @@ def _respond(assistant: Assistant, tts, question: str) -> Answer | None:
         else:
             speech.commit()
 
+    # Как в голосовом режиме: в разговоре инструментов не будет, значит
+    # говорить можно с первой фразы.
+    if speech is not None and assistant.will_be_long_form(question):
+        speech.commit()
+
     started = time.perf_counter()
     try:
         answer = assistant.ask(

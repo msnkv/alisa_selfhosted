@@ -22,6 +22,12 @@ from .prompt import (
     build_system_prompt,
     clean_for_speech,
     looks_like_tool_markup,
+    KNOWLEDGE_WITHHELD,
+    MODE_RECORDS,
+    answer_mode,
+    long_form_cancel,
+    long_form_request,
+    wants_detail,
 )
 from .search import EMPTY_RESULT_MARKER, SearchTools, make_backend
 
@@ -129,6 +135,11 @@ class Assistant:
         # возвращать ему и служебные поля - лишний повод для ошибок.
         self.history: list[dict] = []
 
+        # Режим разговора. Липкий: включается фразой «давай поговорим» или
+        # «расскажи сказку» и держится, пока не скажут «хватит» или
+        # «забудь». Повторять фразу перед каждой репликой было бы странно.
+        self.long_form = False
+
         self.tools: SearchTools | None = None
         if cfg.search.enabled:
             backend = make_backend(
@@ -196,14 +207,53 @@ class Assistant:
         шага с инструментом — не ответ, а присказка, и говорить его
         нельзя, иначе ответ прозвучит дважды.
         """
+        # Длинный ответ просят словами: «раскрой подробно», «детально»,
+        # «говори долго». Тогда и предел в промпте другой, и места под
+        # ответ надо больше - иначе он обрежется на середине фразы.
+        # Разговор включается и выключается словами и держится между
+        # репликами.
+        if long_form_cancel(question):
+            self.long_form = False
+        elif long_form_request(question):
+            self.long_form = True
+        long_form = self.long_form
+
+        # Явная просьба про источник: «посмотри в моих записях» или
+        # «поищи в интернете». Без неё модель решает сама, как и раньше.
+        mode = answer_mode(question)
+        # Вариант «без просьбы в записи не смотреть» - выключен по
+        # умолчанию, см. data.only_on_request в config.yaml.
+        knowledge = self.knowledge.text()
+        if self.cfg.data_only_on_request and mode != MODE_RECORDS:
+            knowledge = KNOWLEDGE_WITHHELD
+
+        detail = wants_detail(question) and not long_form
+        detail_words = self.cfg.detail_words if detail else 0
+        story_words = self.cfg.story_words if long_form else 0
+        if long_form:
+            max_tokens = self.cfg.llm.story_max_tokens
+        elif detail:
+            max_tokens = self.cfg.llm.detail_max_tokens
+        else:
+            max_tokens = self.cfg.llm.max_tokens
+        if detail:
+            log.info("просят подробный ответ: бюджет %d слов", detail_words)
+        if long_form:
+            log.info("режим разговора: бюджет %d слов", story_words)
+        if mode:
+            log.info("просят источник: %s", mode)
+
         system = build_system_prompt(
             name=self.cfg.name,
             owner=self.cfg.owner,
             max_sentences=self.cfg.max_sentences,
             max_words=self.cfg.max_words,
-            knowledge=self.knowledge.text(),
+            knowledge=knowledge,
             tools_available=self.tools is not None,
             city=self.cfg.city,
+            detail_words=detail_words,
+            mode=mode,
+            story_words=story_words,
         )
         # История идёт после системного промпта - значит большой неизменный
         # блок с данными из data/ по-прежнему кэшируется целиком.
@@ -227,7 +277,14 @@ class Assistant:
             last_step = step > self.cfg.agent.max_steps or out_of_time
             # На последнем шаге инструменты не даём: модель обязана ответить
             # словами, иначе цикл не закончится никогда.
-            tools = None if (last_step or self.tools is None) else self.tools.SCHEMAS
+            # В разговоре инструментов не даём совсем: лазить в интернет
+            # посреди сказки незачем, а заодно это делает шаг заведомо
+            # текстовым - и озвучка может начаться с первой фразы.
+            tools = (
+                None
+                if (last_step or self.tools is None or long_form)
+                else self.tools.SCHEMAS
+            )
             if last_step and tools_used and not nudged:
                 # Инструменты уже отработали, а теперь их отобрали -
                 # надо сказать об этом прямо, иначе модель выдаст вызов
@@ -235,7 +292,9 @@ class Assistant:
                 messages.append({"role": "user", "content": LAST_STEP_NUDGE})
                 nudged = True
 
-            content, calls, usage = self._step(messages, tools, on_sentence)
+            content, calls, usage = self._step(
+                messages, tools, on_sentence, max_tokens
+            )
             self._add_usage(totals, usage)
             if on_step is not None:
                 on_step(bool(calls))
@@ -297,15 +356,31 @@ class Assistant:
     def forget(self) -> None:
         """Забыть диалог. Нужно между независимыми вопросами в тестах."""
         self.history.clear()
+        # Разговор тоже заканчивается: «забудь» — это сброс всего.
+        self.long_form = False
+
+    def will_be_long_form(self, question: str) -> bool:
+        """Будет ли ответ разговором — ещё до обращения к модели.
+
+        Нужно голосовому циклу: в этом режиме инструментов нет, значит
+        шаг гарантированно текстовый, и озвучку можно разрешить сразу,
+        с первой фразы. Иначе сказку пришлось бы слушать после минуты
+        тишины — сперва вся генерация, и только потом звук.
+        """
+        if long_form_cancel(question):
+            return False
+        return self.long_form or long_form_request(question)
 
     # --- внутренности -----------------------------------------------------
 
-    def _create_kwargs(self, messages: list[dict], tools: list[dict] | None) -> dict:
+    def _create_kwargs(
+        self, messages: list[dict], tools: list[dict] | None, max_tokens: int
+    ) -> dict:
         kwargs = {
             "model": self.cfg.llm.model,
             "messages": messages,
             "temperature": self.cfg.llm.temperature,
-            "max_tokens": self.cfg.llm.max_tokens,
+            "max_tokens": max_tokens,
             "extra_body": self._extra_body(),
         }
         if tools:
@@ -313,8 +388,15 @@ class Assistant:
             kwargs["tool_choice"] = "auto"
         return kwargs
 
-    def _call_api(self, messages: list[dict], tools: list[dict] | None, *, stream: bool):
-        kwargs = self._create_kwargs(messages, tools)
+    def _call_api(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None,
+        *,
+        stream: bool,
+        max_tokens: int,
+    ):
+        kwargs = self._create_kwargs(messages, tools, max_tokens)
         if stream:
             kwargs["stream"] = True
             # Без этого в потоковом режиме расход токенов не приходит
@@ -340,6 +422,7 @@ class Assistant:
         messages: list[dict],
         tools: list[dict] | None,
         on_sentence: Callable[[str], None] | None,
+        max_tokens: int,
     ):
         """Один обмен с моделью. Возвращает текст, вызовы и расход токенов.
 
@@ -347,7 +430,9 @@ class Assistant:
         в ask про эту разницу ничего не знает.
         """
         if on_sentence is None:
-            response = self._call_api(messages, tools, stream=False)
+            response = self._call_api(
+                messages, tools, stream=False, max_tokens=max_tokens
+            )
             message = response.choices[0].message
             return (
                 message.content or "",
@@ -355,7 +440,8 @@ class Assistant:
                 response.usage,
             )
         return self._read_stream(
-            self._call_api(messages, tools, stream=True), on_sentence
+            self._call_api(messages, tools, stream=True, max_tokens=max_tokens),
+            on_sentence,
         )
 
     @staticmethod

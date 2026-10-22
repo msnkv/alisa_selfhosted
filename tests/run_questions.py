@@ -111,7 +111,14 @@ def _ask_one(
             warnings=[],
         )
 
-    failures, warnings = evaluate(case, answer, assistant.cfg.max_words)
+    # У подробных вопросов бюджет другой, иначе прогон ругался бы на
+    # длину там, где длина и была нужна.
+    budget = (
+        assistant.cfg.detail_words
+        if case.get("detail")
+        else assistant.cfg.max_words
+    )
+    failures, warnings = evaluate(case, answer, budget)
     return Outcome(
         ask=label, kind=kind, answer=answer, failures=failures, warnings=warnings
     )

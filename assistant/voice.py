@@ -232,6 +232,12 @@ class VoiceLoop:
                 speech.commit()
             step_text.clear()
 
+        # В разговоре инструментов не будет, значит шаг заведомо
+        # текстовый - разрешаем говорить сразу, не дожидаясь конца
+        # генерации. Иначе сказку пришлось бы слушать после минуты тишины.
+        if speech is not None and self.assistant.will_be_long_form(transcript.text):
+            speech.commit()
+
         started = time.perf_counter()
         try:
             answer = self.assistant.ask(
