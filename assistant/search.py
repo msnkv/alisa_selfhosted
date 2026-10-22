@@ -9,12 +9,15 @@
 from __future__ import annotations
 
 import logging
+import ssl
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import trafilatura
 from ddgs import DDGS
-from trafilatura.settings import use_config
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +126,48 @@ BACKENDS = {
 }
 
 
+def _make_ssl_context() -> ssl.SSLContext:
+    """Контекст с набором корневых сертификатов из certifi.
+
+    Системному хранилищу Windows не хватает промежуточных сертификатов для
+    части сайтов - cbr.ru, например, отваливался с CERTIFICATE_VERIFY_FAILED.
+    certifi уже стоит как зависимость, и с ним те же сайты открываются.
+    """
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("certifi недоступен (%s), беру системные сертификаты", exc)
+        return ssl.create_default_context()
+
+
+def encode_url(url: str) -> str:
+    """Приводит ссылку к ascii: проценты в пути, punycode в домене.
+
+    Поиск постоянно приносит ссылки с кириллицей - любая статья русской
+    Википедии такая. urllib на них падает с UnicodeEncodeError, поэтому
+    кодируем сами. Знак процента оставлен безопасным, чтобы уже
+    закодированные ссылки не закодировались второй раз.
+    """
+    parts = urlsplit(url)
+    host = parts.netloc
+    try:
+        host.encode("ascii")
+    except UnicodeEncodeError:
+        host = host.encode("idna").decode("ascii")
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            host,
+            quote(parts.path, safe="/%:@!$&'()*+,;="),
+            quote(parts.query, safe="/%:@!$&'()*+,;=?"),
+            quote(parts.fragment, safe="/%:@!$&'()*+,;=?"),
+        )
+    )
+
+
 def make_backend(name: str, **options):
     try:
         factory = BACKENDS[name]
@@ -136,6 +181,10 @@ def make_backend(name: str, **options):
 class SearchTools:
     """Набор инструментов, который видит модель."""
 
+    # Сколько байт страницы читать максимум. Заодно ограничивает время,
+    # которое можно провисеть на сайте, отдающем данные по капле.
+    MAX_PAGE_BYTES = 2_000_000
+
     def __init__(
         self,
         backend,
@@ -147,11 +196,8 @@ class SearchTools:
         self.backend = backend
         self.max_results = max_results
         self.page_chars = page_chars
-
-        # Страницу качаем с коротким таймаутом: ассистент отвечает голосом,
-        # и ждать медленный сайт дольше нескольких секунд бессмысленно.
-        self._fetch_config = use_config()
-        self._fetch_config.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(fetch_timeout_s))
+        self.fetch_timeout_s = fetch_timeout_s
+        self._ssl_context = _make_ssl_context()
 
     # --- сами инструменты -------------------------------------------------
 
@@ -178,10 +224,35 @@ class SearchTools:
             lines.append("")
         return "\n".join(lines).strip()
 
+    def _download(self, url: str) -> bytes | None:
+        """Скачивает страницу с жёстким таймаутом и без повторов.
+
+        Качаем сами, а не через trafilatura.fetch_url: та внутри повторяет
+        запрос трижды, и на медленном сайте восьмисекундный таймаут
+        превращается в двадцать четыре секунды. Проверено на kp.ru - один
+        вопрос про погоду вылетел за весь бюджет цикла.
+        """
+        request = urllib.request.Request(
+            encode_url(url),
+            headers={
+                # Без привычного User-Agent часть сайтов отдаёт заглушку.
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/141.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "ru,en;q=0.8",
+            },
+        )
+        with urllib.request.urlopen(
+            request, timeout=self.fetch_timeout_s, context=self._ssl_context
+        ) as response:
+            return response.read(self.MAX_PAGE_BYTES)
+
     def fetch_page(self, url: str) -> str:
         started = time.perf_counter()
         try:
-            raw = trafilatura.fetch_url(url, config=self._fetch_config)
+            raw = self._download(url)
         except Exception as exc:
             log.warning("fetch_page(%r) упал: %s: %s", url, type(exc).__name__, exc)
             raw = None

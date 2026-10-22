@@ -19,3 +19,6 @@ models/
 logs/*.log
 logs/*.jsonl
 logs/*.md
+
+# Образцы голосов
+samples/

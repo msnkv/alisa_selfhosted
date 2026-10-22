@@ -45,15 +45,28 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class TTSConfig:
+    enabled: bool
+    engine: str
+    model: str
+    speaker: str
+    sample_rate: int
+    device: str
+    output_device: int | str | None
+
+
+@dataclass(frozen=True)
 class Config:
     name: str
     owner: str
     llm: LLMConfig
     search: SearchConfig
     agent: AgentConfig
+    tts: TTSConfig
     max_sentences: int
     max_words: int
     data_dir: Path
+    models_dir: Path
     log_dir: Path
     log_level: str
 
@@ -68,6 +81,7 @@ def load_config(path: Path | None = None) -> Config:
     llm = raw["llm"]
     search = raw.get("search", {})
     agent = raw.get("agent", {})
+    tts = raw.get("tts", {})
 
     return Config(
         name=raw["assistant"]["name"],
@@ -98,9 +112,19 @@ def load_config(path: Path | None = None) -> Config:
             max_steps=int(agent.get("max_steps", 4)),
             total_timeout_s=float(agent.get("total_timeout_s", 35)),
         ),
+        tts=TTSConfig(
+            enabled=bool(tts.get("enabled", True)),
+            engine=tts.get("engine", "silero"),
+            model=tts.get("model", "v5_6_ru"),
+            speaker=tts.get("speaker", "xenia"),
+            sample_rate=int(tts.get("sample_rate", 48000)),
+            device=tts.get("device", "cpu"),
+            output_device=tts.get("output_device"),
+        ),
         max_sentences=int(raw["answer"]["max_sentences"]),
         max_words=int(raw["answer"].get("max_words", 45)),
         data_dir=ROOT / raw["data"]["dir"],
+        models_dir=ROOT / raw.get("models", {}).get("dir", "models"),
         log_dir=ROOT / raw["logging"]["dir"],
         log_level=raw["logging"]["level"].upper(),
     )

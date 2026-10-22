@@ -1,9 +1,12 @@
-"""Текстовый режим: вопрос с клавиатуры, ответ в консоль.
+"""Текстовый режим: вопрос с клавиатуры, ответ в консоль или голосом.
 
 Нужен для отладки без микрофона. Запуск:
     .\\alisa.ps1
     .\\alisa.ps1 --selftest
     .\\alisa.ps1 --ask "где лежат болгарки?"
+    .\\alisa.ps1 --ask "где лежат болгарки?" --speak
+    .\\alisa.ps1 --voices
+    .\\alisa.ps1 --devices
 """
 
 from __future__ import annotations
@@ -12,11 +15,13 @@ import argparse
 import sys
 from dataclasses import replace
 
-from .config import load_config, setup_logging
+from .config import ROOT, load_config, setup_logging
 from .llm import Answer, Assistant
 from .prompt import build_system_prompt, human_now
+from .tts import SAMPLE_TEXT, SPEAKERS, describe_devices, make_tts
 
 EXIT_WORDS = {"выход", "exit", "quit", "q"}
+SAMPLES_DIR = ROOT / "samples"
 
 
 def _force_utf8() -> None:
@@ -38,7 +43,7 @@ def _stats(answer: Answer) -> str:
 
 
 def _announce_tool(name: str, arguments: dict) -> None:
-    """В текстовом режиме просто печатаем, что ассистент пошёл искать.
+    """Печатает, что ассистент пошёл искать.
 
     В голосовом режиме (шаг 5) сюда встанет фраза-заглушка «секунду, смотрю».
     """
@@ -46,8 +51,8 @@ def _announce_tool(name: str, arguments: dict) -> None:
     print(f"  ... {name}: {detail}")
 
 
-def selftest(assistant: Assistant) -> int:
-    """Проверяет, что всё на месте, и делает один живой запрос к API."""
+def selftest(assistant: Assistant, tts) -> int:
+    """Проверяет, что всё на месте, и делает живые запросы."""
     cfg = assistant.cfg
     ok = True
 
@@ -65,6 +70,14 @@ def selftest(assistant: Assistant) -> int:
             f"  интернет:    {cfg.search.backend}"
             f" (движок {cfg.search.engine}, регион {cfg.search.region}),"
             f" до {cfg.agent.max_steps} шагов, бюджет {cfg.agent.total_timeout_s:.0f} с"
+        )
+
+    if tts is None:
+        print("  озвучка:     выключена в config.yaml")
+    else:
+        print(
+            f"  озвучка:     {cfg.tts.engine} {cfg.tts.model},"
+            f" голос {cfg.tts.speaker}, {cfg.tts.sample_rate} Гц, {cfg.tts.device}"
         )
 
     key = cfg.llm.api_key
@@ -96,7 +109,7 @@ def selftest(assistant: Assistant) -> int:
     print(f"  системный промпт: {prompt_len} символов")
 
     if not ok:
-        print("\nЕсть проблемы, запрос к модели не делаю.")
+        print("\nЕсть проблемы, дальше не проверяю.")
         return 1
 
     print("\nПробую запрос к модели...")
@@ -115,28 +128,78 @@ def selftest(assistant: Assistant) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"  ОШИБКА: {type(exc).__name__}: {exc}")
             return 1
-        first = found.splitlines()[0] if found else "(пусто)"
-        print(f"  {first}")
+        print(f"  {found.splitlines()[0] if found else '(пусто)'}")
         if "ничего не вернул" in found:
             print("  поиск не отвечает — попробуй позже или смени engine в config.yaml")
             return 1
+
+    if tts is not None:
+        print("\nПробую озвучку (первый раз качает модель, это небыстро)...")
+        try:
+            elapsed = tts.warm_up()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ОШИБКА: {type(exc).__name__}: {exc}")
+            return 1
+        print(f"  модель загружена и синтез работает, {elapsed:.1f} с на прогрев")
 
     print("\nВсё работает.")
     return 0
 
 
-def ask_once(assistant: Assistant, question: str) -> int:
-    try:
-        answer = assistant.ask(question, on_tool_call=_announce_tool)
-    except Exception as exc:  # noqa: BLE001
-        print(f"ошибка: {type(exc).__name__}: {exc}")
-        return 1
-    print(answer.text)
-    print(_stats(answer))
+def list_devices() -> int:
+    print("Аудиоустройства:\n")
+    print(describe_devices())
+    print(
+        "\nНомер нужного устройства впиши в config.yaml:"
+        "\n  tts.output_device - куда играть"
+    )
     return 0
 
 
-def repl(assistant: Assistant) -> int:
+def render_voices(tts, text: str) -> int:
+    """Озвучивает одну фразу всеми голосами, сохраняет и проигрывает.
+
+    Это замена абстрактному сравнению движков: слушаешь одну и ту же
+    фразу пятью голосами на своих наушниках и выбираешь.
+    """
+    if tts is None:
+        print("Озвучка выключена в config.yaml")
+        return 1
+
+    print(f"Фраза: {text}\n")
+    for speaker in SPEAKERS:
+        path = SAMPLES_DIR / f"{speaker}.wav"
+        try:
+            tts.save(text, path, speaker=speaker)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {speaker}: ОШИБКА {type(exc).__name__}: {exc}")
+            continue
+        print(f"  {speaker}: {path}")
+        tts.say(text, speaker=speaker)
+
+    print(f"\nФайлы лежат в {SAMPLES_DIR}")
+    print("Понравившийся голос впиши в config.yaml, tts.speaker")
+    return 0
+
+
+def _respond(assistant: Assistant, tts, question: str) -> Answer | None:
+    try:
+        answer = assistant.ask(question, on_tool_call=_announce_tool)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ошибка: {type(exc).__name__}: {exc}")
+        return None
+
+    print(f"\n{answer.text}")
+    print(_stats(answer))
+    if tts is not None:
+        try:
+            tts.say(answer.text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  озвучка не удалась: {type(exc).__name__}: {exc}")
+    return answer
+
+
+def repl(assistant: Assistant, tts) -> int:
     print(f"{assistant.cfg.name}: текстовый режим. Пустая строка или «выход» — закончить.\n")
     while True:
         try:
@@ -148,14 +211,8 @@ def repl(assistant: Assistant) -> int:
         if not question or question.lower() in EXIT_WORDS:
             return 0
 
-        try:
-            answer = assistant.ask(question, on_tool_call=_announce_tool)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  ошибка: {type(exc).__name__}: {exc}\n")
-            continue
-
-        print(f"\n{answer.text}")
-        print(_stats(answer) + "\n")
+        _respond(assistant, tts, question)
+        print()
 
 
 def main() -> int:
@@ -163,25 +220,51 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Текстовый режим голосового помощника")
     parser.add_argument(
-        "--selftest", action="store_true", help="проверить окружение, API и поиск"
+        "--selftest", action="store_true", help="проверить окружение, API, поиск и озвучку"
     )
     parser.add_argument("--ask", metavar="ВОПРОС", help="задать один вопрос и выйти")
     parser.add_argument(
+        "--speak", action="store_true", help="озвучить ответ, а не только напечатать"
+    )
+    parser.add_argument(
         "--no-web", action="store_true", help="ответить без доступа в интернет"
+    )
+    parser.add_argument(
+        "--voices", nargs="?", const=SAMPLE_TEXT, metavar="ФРАЗА",
+        help="озвучить фразу всеми голосами и сохранить в samples/",
+    )
+    parser.add_argument(
+        "--devices", action="store_true", help="показать аудиоустройства с номерами"
     )
     args = parser.parse_args()
 
     cfg = load_config()
     setup_logging(cfg)
+
+    if args.devices:
+        return list_devices()
+
     if args.no_web:
         cfg = replace(cfg, search=replace(cfg.search, enabled=False))
+
+    # Озвучку создаём, но модель она подгрузит только когда понадобится.
+    tts = make_tts(cfg) if cfg.tts.enabled else None
+
+    if args.voices:
+        return render_voices(tts, args.voices)
+
     assistant = Assistant(cfg)
 
     if args.selftest:
-        return selftest(assistant)
+        return selftest(assistant, tts)
+
+    # В обычном режиме молчим, пока не попросили голос: отлаживать текстом
+    # быстрее, чем слушать каждый ответ.
+    speaker = tts if args.speak else None
+
     if args.ask:
-        return ask_once(assistant, args.ask)
-    return repl(assistant)
+        return 0 if _respond(assistant, speaker, args.ask) else 1
+    return repl(assistant, speaker)
 
 
 if __name__ == "__main__":

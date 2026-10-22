@@ -46,7 +46,14 @@ class Knowledge:
     def files(self) -> list[Path]:
         if not self.data_dir.is_dir():
             return []
-        return sorted(self.data_dir.glob("*.md"))
+        # README в data/ - это инструкция для человека, а не знание про него.
+        # Без этой строчки она уезжает в промпт и ассистент считает её
+        # частью моих личных данных.
+        return sorted(
+            path
+            for path in self.data_dir.glob("*.md")
+            if path.stem.lower() != "readme"
+        )
 
     def _current_fingerprint(self) -> tuple:
         return tuple((p.name, p.stat().st_mtime_ns) for p in self.files())
