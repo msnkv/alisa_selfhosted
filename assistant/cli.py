@@ -22,6 +22,7 @@ from .mic import make_microphone
 from .prompt import build_system_prompt, human_now
 from .stt import make_stt
 from .tts import SAMPLE_TEXT, SPEAKERS, SpeechQueue, describe_devices, make_tts
+from .server import serve
 from .voice import VoiceLoop
 from .wake import make_wake_word
 
@@ -359,6 +360,14 @@ def main() -> int:
         "--wake-test", action="store_true",
         help="показать уверенность модели кодовой фразы, чтобы подобрать порог",
     )
+    parser.add_argument(
+        "--serve", action="store_true",
+        help="отвечать на вопросы по домашней сети (для спутника и телефона)",
+    )
+    parser.add_argument(
+        "--client", nargs="?", const="", metavar="АДРЕС",
+        help="работать спутником: микрофон тут, мозги на сервере",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -384,7 +393,27 @@ def main() -> int:
         make_wake_word(cfg).monitor()
         return 0
 
+    if args.client is not None:
+        # Спутнику не нужны ни ключ, ни модели: он только пишет звук,
+        # отправляет его и играет ответ.
+        from .client import Satellite
+
+        wake = make_wake_word(cfg) if cfg.wake.enabled and not args.voice else None
+        satellite = Satellite(
+            cfg,
+            args.client or cfg.server.url,
+            microphone=make_microphone(cfg),
+            wake=wake,
+        )
+        return satellite.run() if wake is None else satellite.run_wake()
+
     assistant = Assistant(cfg)
+
+    if args.serve:
+        if not cfg.stt.enabled:
+            print("Серверу нужно включённое stt в config.yaml")
+            return 1
+        return serve(cfg, assistant, make_stt(cfg), tts)
 
     if args.voice or args.wake:
         if tts is None or not cfg.stt.enabled:

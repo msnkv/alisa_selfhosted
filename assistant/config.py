@@ -93,6 +93,15 @@ class MicConfig:
 
 
 @dataclass(frozen=True)
+class ServerConfig:
+    host: str
+    port: int
+    token: str
+    timeout_s: float
+    url: str
+
+
+@dataclass(frozen=True)
 class Config:
     name: str
     owner: str
@@ -103,6 +112,7 @@ class Config:
     stt: STTConfig
     mic: MicConfig
     wake: WakeConfig
+    server: ServerConfig
     max_sentences: int
     max_words: int
     data_dir: Path
@@ -125,6 +135,7 @@ def load_config(path: Path | None = None) -> Config:
     stt = raw.get("stt", {})
     mic = raw.get("mic", {})
     wake = raw.get("wake", {})
+    server = raw.get("server", {})
 
     return Config(
         name=raw["assistant"]["name"],
@@ -194,6 +205,17 @@ def load_config(path: Path | None = None) -> Config:
             input_device=wake.get("input_device"),
             cooldown_s=float(wake.get("cooldown_s", 1.0)),
             follow_up_s=float(wake.get("follow_up_s", 8.0)),
+        ),
+        server=ServerConfig(
+            host=server.get("host", "0.0.0.0"),
+            port=int(server.get("port", 8765)),
+            # Пустой токен = спросить может любой в домашней сети.
+            token=str(server.get("token", "") or ""),
+            timeout_s=float(server.get("timeout_s", 90)),
+            url=str(
+                server.get("url")
+                or "http://localhost:%d" % int(server.get("port", 8765))
+            ),
         ),
         max_sentences=int(raw["answer"]["max_sentences"]),
         max_words=int(raw["answer"].get("max_words", 45)),
