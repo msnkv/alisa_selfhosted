@@ -19,7 +19,7 @@ from dataclasses import replace
 from .config import ROOT, load_config, setup_logging
 from .llm import Answer, Assistant
 from .mic import make_microphone
-from .prompt import build_system_prompt, human_now
+from .prompt import build_system_prompt, human_now, is_forget
 from .stt import make_stt
 from .tts import SAMPLE_TEXT, SPEAKERS, SpeechQueue, describe_devices, make_tts
 from .server import serve
@@ -28,7 +28,6 @@ from .wake import make_wake_word
 
 EXIT_WORDS = {"выход", "exit", "quit", "q"}
 # Сменить тему, не перезапуская ассистента.
-FORGET_WORDS = {"забудь", "сброс", "новая тема"}
 SAMPLES_DIR = ROOT / "samples"
 
 
@@ -315,7 +314,7 @@ def repl(assistant: Assistant, tts) -> int:
         if not question or question.lower() in EXIT_WORDS:
             return 0
 
-        if question.lower() in FORGET_WORDS:
+        if is_forget(question):
             assistant.forget()
             print("  разговор забыт")
             print()

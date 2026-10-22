@@ -17,12 +17,12 @@ from dataclasses import dataclass
 
 from .config import Config
 from .llm import Assistant
+from .prompt import FORGOTTEN_REPLY, is_forget
 from .tts import SpeechQueue
 
 log = logging.getLogger(__name__)
 
 EXIT_WORDS = {"выход", "exit", "quit", "q"}
-FORGET_WORDS = {"забудь", "сброс", "новая тема"}
 
 # Пока ассистент ищет в интернете, проходит от четырёх до шестнадцати секунд.
 # Тишина такой длины из колонки выглядит как «сломалось», поэтому сразу
@@ -197,10 +197,10 @@ class VoiceLoop:
         print(f"\n  ты: {transcript.text}")
 
         # «Забудь» голосом: сменить тему, не трогая клавиатуру.
-        if transcript.text.strip().lower().rstrip(".!?") in FORGET_WORDS:
+        if is_forget(transcript.text):
             self.assistant.forget()
             print("  разговор забыт")
-            self.tts.say("Забыла, слушаю заново.")
+            self.tts.say(FORGOTTEN_REPLY)
             return None
 
         # В потоковом режиме озвучка идёт параллельно генерации: очередь
@@ -297,7 +297,7 @@ class VoiceLoop:
             if command in EXIT_WORDS:
                 return 0
 
-            if command in FORGET_WORDS:
+            if is_forget(command):
                 self.assistant.forget()
                 print("  разговор забыт")
                 print()

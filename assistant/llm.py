@@ -203,6 +203,7 @@ class Assistant:
             max_words=self.cfg.max_words,
             knowledge=self.knowledge.text(),
             tools_available=self.tools is not None,
+            city=self.cfg.city,
         )
         # История идёт после системного промпта - значит большой неизменный
         # блок с данными из data/ по-прежнему кэшируется целиком.

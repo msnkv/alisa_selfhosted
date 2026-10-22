@@ -37,6 +37,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
+from .prompt import FORGOTTEN_REPLY, is_forget
+
 log = logging.getLogger(__name__)
 
 # Больше этого от клиента не принимаем: запись фразы это десятки
@@ -76,6 +78,10 @@ class Brain:
         self.stt = stt
         self.tts = tts
         self._lock = threading.Lock()
+        # Фраза-заглушка готовится здесь, а играет её спутник. Синтеза у
+        # него нет и быть не должно, но и молчать пятнадцать секунд,
+        # пока идёт поиск, нельзя: человек не понимает, живо ли оно.
+        self.filler: bytes | None = None
 
     def warm_up(self) -> None:
         print("Готовлю модели...")
@@ -84,8 +90,13 @@ class Brain:
             self.stt.warm_up()
             print(f"  распознавание: {time.perf_counter() - started:.1f} с")
         if self.tts is not None:
+            from .voice import FILLER_PHRASE
+
             started = time.perf_counter()
             self.tts.warm_up()
+            samples = self.tts.synthesize(FILLER_PHRASE)
+            if len(samples):
+                self.filler = encode_wav(samples, self.tts.sample_rate)
             print(f"  синтез речи: {time.perf_counter() - started:.1f} с")
 
     def answer_audio(self, body: bytes, suffix: str) -> dict:
@@ -110,6 +121,14 @@ class Brain:
         return self.answer_text(transcript.text, heard=transcript.text)
 
     def answer_text(self, question: str, *, heard: str = "") -> dict:
+        # «Забудь» обрабатываем здесь, а не в модели. Спутник текста не
+        # видит - он отправляет звук, - поэтому проверить команду может
+        # только сервер. Без этого модель отвечала «забыла», ничего при
+        # этом не забывая.
+        if is_forget(question):
+            self.forget()
+            return self._spoken(FORGOTTEN_REPLY, heard or question)
+
         with self._lock:
             answer = self.assistant.ask(question)
             audio = None
@@ -127,6 +146,19 @@ class Brain:
         if audio is not None:
             result["sample_rate"] = self.tts.sample_rate
             result["audio"] = base64.b64encode(audio).decode("ascii")
+        return result
+
+    def _spoken(self, text: str, heard: str) -> dict:
+        """Готовый ответ своими словами, без обращения к модели."""
+        result = {"heard": heard, "text": text, "seconds": 0.0, "tools": []}
+        if self.tts is not None:
+            with self._lock:
+                samples = self.tts.synthesize(text)
+            if len(samples):
+                result["sample_rate"] = self.tts.sample_rate
+                result["audio"] = base64.b64encode(
+                    encode_wav(samples, self.tts.sample_rate)
+                ).decode("ascii")
         return result
 
     def forget(self) -> None:
@@ -169,15 +201,19 @@ PAGE = """<!doctype html>
   <button type="submit">Спросить</button>
 </form>
 
-<button id="talk">Нажать и говорить</button>
+<button id="talk">Говорить</button>
+<div id="diag" class="note"></div>
 
 <div id="out"></div>
 <audio id="player" hidden></audio>
 
 <p class="note">
-Голос работает только на защищённом соединении: браузеры не дают доступ
-к микрофону по обычному http, кроме localhost. С телефона по домашней
-сети кнопка скажет об этом прямо. Текстом работает всегда.
+Нажми «Говорить», скажи вопрос, нажми ещё раз. Голос работает только на
+защищённом соединении: браузеры не дают микрофон по обычному http, кроме
+localhost. Обойти это на своём телефоне можно так: в Chrome открой
+chrome://flags, найди «Insecure origins treated as secure», впиши туда
+адрес этой страницы вместе с портом и перезапусти браузер. Текстом
+работает всегда.
 </p>
 
 <script>
@@ -235,51 +271,79 @@ document.getElementById("ask").onsubmit = (event) => {
 };
 
 const talk = document.getElementById("talk");
+const diag = document.getElementById("diag");
 let recorder = null;
+let stream = null;
+let starting = false;
+
+// Сразу видно, считает ли браузер страницу защищённой. Если флаг в
+// chrome://flags не подхватился, это единственный способ понять это,
+// не гадая.
+diag.textContent = "микрофон: " + (
+  !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia
+    ? "недоступен в этом браузере"
+    : window.isSecureContext
+      ? "доступен"
+      : "браузер считает страницу незащищённой, разрешения не даст"
+);
+
+function idle() {
+  recorder = null;
+  talk.classList.remove("recording");
+  talk.textContent = "Говорить";
+}
 
 async function startTalking() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    out.textContent =
-      "Браузер не даёт микрофон по обычному http. Спрашивай текстом," +
-      " либо открой страницу с самого ПК по адресу localhost.";
-    return;
-  }
-  let stream;
+  if (starting || recorder) return;
+  starting = true;
+  talk.textContent = "Включаю микрофон...";
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("браузер не даёт микрофон по обычному http");
+    }
+    if (typeof MediaRecorder === "undefined") {
+      throw new Error("в этом браузере нет MediaRecorder");
+    }
+    // Поток держим открытым между вопросами: разрешение спрашивается
+    // один раз, и следующая запись начинается сразу.
+    if (!stream) {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+    const parts = [];
+    recorder = new MediaRecorder(stream);
+    recorder.ondataavailable = (event) => parts.push(event.data);
+    recorder.onstop = () => {
+      const type = recorder.mimeType || "audio/webm";
+      idle();
+      send({
+        method: "POST",
+        headers: { "Content-Type": type },
+        body: new Blob(parts, { type }),
+      });
+    };
+    recorder.start();
+    talk.classList.add("recording");
+    talk.textContent = "Говори... нажми, когда закончишь";
   } catch (error) {
-    out.textContent = "Микрофон недоступен: " + error.name;
-    return;
+    idle();
+    out.textContent =
+      "Микрофон не включился: " + (error.message || error.name) +
+      ". Спрашивай текстом, либо впиши адрес этой страницы с портом в" +
+      " chrome://flags, пункт «Insecure origins treated as secure», и" +
+      " перезапусти браузер.";
+  } finally {
+    starting = false;
   }
-  const parts = [];
-  recorder = new MediaRecorder(stream);
-  recorder.ondataavailable = (event) => parts.push(event.data);
-  recorder.onstop = () => {
-    stream.getTracks().forEach((track) => track.stop());
-    const blob = new Blob(parts, { type: recorder.mimeType });
-    send({
-      method: "POST",
-      headers: { "Content-Type": blob.type || "audio/webm" },
-      body: blob,
-    });
-  };
-  recorder.start();
-  talk.classList.add("recording");
-  talk.textContent = "Говори, отпусти когда закончишь";
 }
 
-function stopTalking() {
-  talk.classList.remove("recording");
-  talk.textContent = "Нажать и говорить";
+// Два нажатия, а не удержание. При удержании первый раз поверх кнопки
+// встаёт запрос разрешения: он съедает отпускание пальца, и запись
+// либо не начиналась, либо не останавливалась — со стороны выглядело
+// как «кнопка ничего не делает».
+talk.addEventListener("click", () => {
   if (recorder && recorder.state === "recording") recorder.stop();
-  recorder = null;
-}
-
-talk.addEventListener("pointerdown", startTalking);
-talk.addEventListener("pointerup", stopTalking);
-// pointerleave тут намеренно нет: на телефоне палец легко съезжает с
-// кнопки, и запись обрывалась бы на середине фразы.
-talk.addEventListener("pointercancel", stopTalking);
+  else startTalking();
+});
 
 // Экран не гаснет, пока страница открыта. Нужно, если телефон живёт
 // в розетке и работает колонкой. Работает только на защищённом
@@ -340,6 +404,14 @@ def make_handler(brain: Brain, token: str):
 
             if parts.path == "/health":
                 self._send(200, b"ok\n", "text/plain; charset=utf-8")
+                return
+            if parts.path == "/filler.wav":
+                # Спутник забирает её один раз при запуске и держит в
+                # памяти: играть её надо мгновенно, а не качать каждый раз.
+                if brain.filler is None:
+                    self._send(404, b"no filler\n", "text/plain; charset=utf-8")
+                    return
+                self._send(200, brain.filler, "audio/wav")
                 return
             if parts.path in ("/", "/index.html"):
                 if not self._allowed(query):

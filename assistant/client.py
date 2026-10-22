@@ -24,6 +24,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -31,15 +32,21 @@ import wave
 
 import numpy as np
 
+from .prompt import is_forget
 from .server import encode_wav
 
 log = logging.getLogger(__name__)
 
 EXIT_WORDS = {"выход", "exit", "quit", "q"}
-FORGET_WORDS = {"забудь", "сброс", "новая тема"}
 
 # Запись с микрофона у нас всегда в этой частоте, см. mic.py.
 RECORD_RATE = 16000
+
+# Столько тишины человек терпит спокойно; дальше надо подать голос.
+FILLER_AFTER_S = 1.5
+# И повторять, пока идёт поиск: вопрос с несколькими попытками занимает
+# до полуминуты, и молчание всё это время выглядит как поломка.
+FILLER_GAP_S = 8.0
 
 
 def decode_wav(data: bytes) -> tuple[np.ndarray, int]:
@@ -67,6 +74,10 @@ class Satellite:
         self.url = url.rstrip("/")
         self.microphone = microphone
         self.wake = wake
+        # Фраза-заглушка в голосе ассистента. Синтеза здесь нет, поэтому
+        # её готовит сервер, а спутник забирает один раз при запуске.
+        self.filler = None
+        self.filler_rate = 0
 
     # --- обмен с сервером -------------------------------------------------
 
@@ -89,7 +100,17 @@ class Satellite:
             print("Запусти его на ПК командой .\\alisa.ps1 --serve")
             return False
         print(f"Сервер {self.url} на связи.")
+        self.load_filler()
         return True
+
+    def load_filler(self) -> None:
+        """Забирает у сервера фразу «секунду, смотрю»."""
+        try:
+            with urllib.request.urlopen(self.url + "/filler.wav", timeout=10) as answer:
+                self.filler, self.filler_rate = decode_wav(answer.read())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("заглушку забрать не удалось: %s", exc)
+            print("  (заглушки не будет: сервер её не отдал)")
 
     # --- звук -------------------------------------------------------------
 
@@ -98,6 +119,41 @@ class Satellite:
 
         sd.play(samples, samplerate=rate, device=self.cfg.tts.output_device)
         sd.wait()
+
+    def _post_with_filler(self, body: bytes) -> dict:
+        """Отправляет вопрос и подаёт голос, пока сервер думает.
+
+        Без этого после «договорил» идёт полная тишина — на вопросе с
+        поиском это пятнадцать секунд, и человек не понимает, живо ли
+        оно вообще. Запрос уходит в отдельный поток, а главный ждёт его
+        и в паузах играет заглушку.
+        """
+        outcome: dict = {}
+
+        def worker() -> None:
+            try:
+                outcome["data"] = self._post("/ask", body, "audio/wav")
+            except Exception as exc:  # noqa: BLE001
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=worker, name="ask", daemon=True)
+        thread.start()
+
+        waited = FILLER_AFTER_S
+        while True:
+            thread.join(waited)
+            if not thread.is_alive():
+                break
+            if self.filler is None:
+                # Заглушки нет - просто ждём дальше, но молча.
+                waited = FILLER_GAP_S
+                continue
+            self.play(self.filler, self.filler_rate)
+            waited = FILLER_GAP_S
+
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["data"]
 
     def _say_server_answer(self, result: dict) -> None:
         if result.get("heard"):
@@ -135,7 +191,7 @@ class Satellite:
         body = encode_wav(audio, RECORD_RATE)
         started = time.perf_counter()
         try:
-            result = self._post("/ask", body, "audio/wav")
+            result = self._post_with_filler(body)
         except urllib.error.HTTPError as exc:
             print(f"  сервер ответил {exc.code}: {exc.read().decode('utf-8', 'replace')}")
             return True
@@ -181,7 +237,7 @@ class Satellite:
                 return 0
             if command in EXIT_WORDS:
                 return 0
-            if command in FORGET_WORDS:
+            if is_forget(command):
                 self.forget()
                 print()
                 continue

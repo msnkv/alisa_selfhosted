@@ -105,6 +105,7 @@ class ServerConfig:
 class Config:
     name: str
     owner: str
+    city: str
     llm: LLMConfig
     search: SearchConfig
     agent: AgentConfig
@@ -140,6 +141,7 @@ def load_config(path: Path | None = None) -> Config:
     return Config(
         name=raw["assistant"]["name"],
         owner=raw["assistant"]["owner"],
+        city=str(raw["assistant"].get("city", "") or ""),
         llm=LLMConfig(
             model=llm["model"],
             base_url=llm["base_url"],
