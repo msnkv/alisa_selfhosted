@@ -34,6 +34,13 @@ FRAME_TIMEOUT_S = 1.0
 # Не пришёл первый кадр — переоткрываем поток столько раз, потом сдаёмся.
 REOPEN_ATTEMPTS = 1
 
+# Фон для порога громкости меряем по медиане первых кадров, а не по
+# одному первому: см. EnergyVad. Десять кадров — около трети секунды.
+CALIBRATION_FRAMES = 10
+# Тише этого — цифровой ноль, которым поток иногда начинается, а не
+# тишина в комнате. Такие кадры в замер фона не берём.
+SILENT_LEVEL = 1e-6
+
 SILERO_VAD_REPO = "snakers4/silero-vad"
 
 
@@ -110,6 +117,17 @@ class EnergyVad:
 
     `floor_min` — нижняя граница порога. Без неё в полной тишине (фон
     около нуля) речью становится любой шорох.
+
+    **Начальный фон — медиана первой трети секунды, а не первый кадр.**
+    Поймано на чайнике 24.10.2026: после ответа ассистент принял шум
+    кипящего чайника за речь и ушёл в цикл «не разобрала». Фон брался
+    по одному кадру, а поток сразу после открытия бывает тише комнаты,
+    вплоть до цифрового нуля. Фон выходил заниженным, а вверх он
+    растёт медленно — секунд пятнадцать, — и ровный шум всё это время
+    был «громче фона вдвое». Пока замер идёт, речью ничего не
+    считается; звук при этом пишется, так что начало фразы не теряется.
+    Если человек заговорил сразу и медиана вышла завышенной, она быстро
+    опустится на первой же паузе между словами.
     """
 
     name = "громкость"
@@ -126,6 +144,7 @@ class EnergyVad:
         # какой-то комнате окажется, что так лучше.
         self.fixed = fixed
         self.floor = None
+        self._first: list[float] = []
         self.level = 0.0
         self.threshold = fixed if fixed is not None else floor_min
 
@@ -133,19 +152,25 @@ class EnergyVad:
         # Фон меряем заново на каждой фразе: между фразами в комнате
         # могло измениться что угодно.
         self.floor = None
+        self._first = []
 
     def probability(self, frame: np.ndarray) -> float:
         level = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
         self.level = level
 
         if self.floor is None:
-            self.floor = level
+            if level > SILENT_LEVEL:
+                self._first.append(level)
+            if len(self._first) >= CALIBRATION_FRAMES:
+                self.floor = float(np.median(self._first))
         elif level < self.floor:
             self.floor += 0.2 * (level - self.floor)
         else:
             self.floor += 0.002 * (level - self.floor)
 
         if self.fixed is None:
+            if self.floor is None:
+                return 0.0
             self.threshold = max(self.floor_min, self.floor * self.ratio)
         return 1.0 if level > self.threshold else 0.0
 

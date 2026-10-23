@@ -260,6 +260,7 @@ class Satellite:
         at = NOD_AFTER_S
         nod = False
         fillers = 0
+        heard = None
         print("  Ctrl+C — остановить текущий ответ.")
         try:
             while not stopped.is_set():
@@ -285,7 +286,8 @@ class Satellite:
                 if kind == "search":
                     search = True
                 elif kind == "heard":
-                    print(f"  ты: {event['text']}")
+                    heard = event["text"]
+                    print(f"  ты: {heard}" if heard else "  (сервер речи не разобрал)")
                 elif kind == "sentence":
                     print(f"  {self.cfg.name}: {event['text']}")
                     if event.get("audio"):
@@ -298,6 +300,7 @@ class Satellite:
                 elif kind == "done":
                     completed = True
                     event["first_sound_s"] = first_sound_s
+                    event["heard"] = heard
                     return event
                 elif kind == "error":
                     raise RuntimeError(event["text"])
@@ -377,6 +380,12 @@ class Satellite:
             return True
 
         if result.get("cancelled"):
+            return False
+        # Сервер ничего не разобрал — это шум, а не вопрос. Уточнение не
+        # продолжаем, иначе ровный шум (кипящий чайник, 24.10.2026)
+        # гоняет круг «не разобрала» без конца. Не та фраза — человек
+        # позовёт снова.
+        if result.get("heard") == "":
             return False
         # Ответ играется по ходу приёма, поэтому круг включает и речь:
         # задержку честно показывает только первый звук.

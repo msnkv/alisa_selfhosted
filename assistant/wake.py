@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import queue
 import time
+from contextlib import closing
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,38 @@ def open_stream(device, blocksize: int):
         callback=callback,
     )
     return stream, chunks
+
+
+# Сколько секунд без единого кадра терпим, прежде чем открыть поток заново.
+STALL_S = 3.0
+
+
+def stream_frames(device, blocksize: int):
+    """Кадры с микрофона; умерший поток открывается заново.
+
+    Поймано на спутнике 24.10.2026: посреди ожидания кодовой фразы поток
+    перестал отдавать кадры, и ассистент раз в секунду писал «микрофон
+    молчит», ждал тот же мёртвый поток и не просыпался, пока его не
+    перезапустили. Почему поток умирает, отсюда не видно, но новый
+    обычно работает — так же лечится и запись вопроса в `mic.py`.
+
+    Пока кадров нет, отдаёт None раз в секунду: вызывающему надо
+    проверять свой срок, даже когда звука нет.
+    """
+    while True:
+        stream, chunks = open_stream(device, blocksize)
+        silent_s = 0.0
+        with stream:
+            while silent_s < STALL_S:
+                try:
+                    frame = chunks.get(timeout=1.0)
+                except queue.Empty:
+                    silent_s += 1.0
+                    yield None
+                    continue
+                silent_s = 0.0
+                yield frame
+        log.warning("микрофон молчит %.0f с, открываю поток заново", STALL_S)
 
 
 class WakeWord:
@@ -148,17 +181,13 @@ class WakeWord:
         не будит сам себя через колонки.
         """
         self.model.reset()
-        stream, chunks = self._stream()
         started = time.perf_counter()
 
-        with stream:
-            while True:
+        with closing(stream_frames(self.device, CHUNK)) as frames:
+            for frame in frames:
                 if timeout_s is not None and time.perf_counter() - started > timeout_s:
                     return False
-                try:
-                    frame = chunks.get(timeout=1.0)
-                except queue.Empty:
-                    log.warning("микрофон молчит - данные не идут")
+                if frame is None:
                     continue
 
                 scores = self.model.predict(frame)
@@ -403,17 +432,13 @@ class VoskWakeWord:
 
     def wait(self, *, timeout_s: float | None = None) -> bool:
         recognizer = self._recognizer()
-        stream, chunks = open_stream(self.device, self.CHUNK)
         started = time.perf_counter()
 
-        with stream:
-            while True:
+        with closing(stream_frames(self.device, self.CHUNK)) as frames:
+            for frame in frames:
                 if timeout_s is not None and time.perf_counter() - started > timeout_s:
                     return False
-                try:
-                    frame = chunks.get(timeout=1.0)
-                except queue.Empty:
-                    log.warning("микрофон молчит - данные не идут")
+                if frame is None:
                     continue
                 result = self._read(recognizer, frame)
                 if result is None:
