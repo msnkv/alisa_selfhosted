@@ -485,7 +485,10 @@ def make_handler(brain: Brain, token: str):
                 else:
                     # Расширение нужно av, чтобы понять формат. Браузер
                     # присылает webm, наш спутник - wav.
-                    suffix = ".wav" if "wav" in kind else ".webm"
+                    suffix = (
+                        ".wav" if "wav" in kind else
+                        ".ogg" if "ogg" in kind or "opus" in kind else ".webm"
+                    )
                     result = brain.answer_audio(body, suffix)
             except Exception as exc:  # noqa: BLE001
                 log.exception("запрос упал")
