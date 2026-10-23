@@ -99,7 +99,7 @@ class Brain:
             for name, texts in POOLS.items():
                 ready = []
                 for text in texts:
-                    samples = self.tts.say_short(text)
+                    samples = self.tts.synthesize(text)
                     if len(samples):
                         ready.append((text, encode_wav(samples, self.tts.sample_rate)))
                 self.phrases[name] = ready

@@ -131,7 +131,7 @@ class VoiceLoop:
         """Синтезирует набор служебных фраз в пары «текст, звук»."""
         ready = []
         for text in texts:
-            samples = self.tts.say_short(text)
+            samples = self.tts.synthesize(text)
             if len(samples):
                 ready.append((text, samples))
         return Pool(ready)
