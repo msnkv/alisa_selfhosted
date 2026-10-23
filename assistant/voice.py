@@ -324,7 +324,7 @@ class VoiceLoop:
             return 1
 
         self.warm_up()
-        spoken = self.cfg.wake.model.replace("_", " ")
+        spoken = self.wake.spoken
         print(
             f"\n{self.cfg.name} ждёт кодовую фразу: «{spoken}»."
             "\nСкажи её, потом задай вопрос. Ctrl+C — закончить.\n"

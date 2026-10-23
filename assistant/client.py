@@ -256,7 +256,7 @@ class Satellite:
         self.wake.warm_up()
         print(f"Кодовая фраза готова за {time.perf_counter() - started:.1f} с")
 
-        spoken = self.cfg.wake.model.replace("_", " ")
+        spoken = self.wake.spoken
         print(f"\nСпутник ждёт «{spoken}». Ctrl+C — закончить.\n")
 
         while True:

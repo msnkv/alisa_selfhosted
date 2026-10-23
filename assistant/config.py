@@ -76,6 +76,12 @@ class STTConfig:
 @dataclass(frozen=True)
 class WakeConfig:
     enabled: bool
+    engine: str
+    phrase: str
+    variants: tuple[str, ...]
+    model_dir: Path | None
+    language: str
+    min_confidence: float
     model: str
     threshold: float
     vad_threshold: float
@@ -212,6 +218,14 @@ def load_config(path: Path | None = None) -> Config:
         ),
         wake=WakeConfig(
             enabled=bool(wake.get("enabled", True)),
+            engine=str(wake.get("engine", "openwakeword")),
+            phrase=str(wake.get("phrase", "алиса тян")),
+            variants=tuple(wake.get("variants", []) or ()),
+            model_dir=(
+                ROOT / wake["model_dir"] if wake.get("model_dir") else None
+            ),
+            language=str(wake.get("language", "ru")),
+            min_confidence=float(wake.get("min_confidence", 0.8)),
             model=wake.get("model", "hey_jarvis"),
             threshold=float(wake.get("threshold", 0.5)),
             vad_threshold=float(wake.get("vad_threshold", 0.5)),
