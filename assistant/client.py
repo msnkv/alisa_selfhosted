@@ -97,7 +97,9 @@ class Satellite:
                 answer.read()
         except Exception as exc:  # noqa: BLE001
             print(f"Сервер {self.url} не отвечает: {type(exc).__name__}: {exc}")
-            print("Запусти его на ПК командой .\\alisa.ps1 --serve")
+            # Подсказываем оба варианта: из cmd файл .ps1 не
+            # запускается, а открывается в блокноте.
+            print("Запусти его на ПК: alisa.bat --serve (или .\\alisa.ps1 --serve)")
             return False
         print(f"Сервер {self.url} на связи.")
         self.load_filler()
