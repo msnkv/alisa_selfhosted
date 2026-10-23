@@ -24,6 +24,16 @@ SAMPLE_RATE = 16000
 FRAME = 512
 FRAME_SECONDS = FRAME / SAMPLE_RATE
 
+# Сколько ждать первый кадр после открытия микрофона. Поймано на
+# ноутбуке-спутнике: сразу после того, как отзвучал «да?» или ответ,
+# Windows иногда отдаёт первый кадр позже секунды, и запись сдавалась с
+# «микрофон молчит», не дав сказать ни слова. Посреди записи по-прежнему
+# хватает секунды тишины в данных, чтобы считать микрофон отвалившимся.
+FIRST_FRAME_S = 3.0
+FRAME_TIMEOUT_S = 1.0
+# Не пришёл первый кадр — переоткрываем поток столько раз, потом сдаёмся.
+REOPEN_ATTEMPTS = 1
+
 SILERO_VAD_REPO = "snakers4/silero-vad"
 
 
@@ -230,26 +240,63 @@ class Microphone:
                 log.debug("микрофон: %s", status)
             chunks.put(indata[:, 0].copy())
 
+        def open_stream():
+            stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=FRAME,
+                device=self.device,
+                callback=callback,
+            )
+            stream.start()
+            return stream
+
+        # Первый кадр ждём отдельно и дольше: запуск микрофона сразу после
+        # звука из динамика бывает медленным, а это не поломка.
+        stream = None
+        first_frame = None
+        for attempt in range(1 + REOPEN_ATTEMPTS):
+            opened = time.perf_counter()
+            stream = open_stream()
+            try:
+                first_frame = chunks.get(timeout=FIRST_FRAME_S)
+            except queue.Empty:
+                stream.close()
+                log.warning(
+                    "микрофон молчит %.0f с после открытия, попытка %d из %d",
+                    FIRST_FRAME_S, attempt + 1, 1 + REOPEN_ATTEMPTS,
+                )
+                continue
+            log.info(
+                "первый кадр с микрофона через %.2f с%s",
+                time.perf_counter() - opened,
+                " (после переоткрытия)" if attempt else "",
+            )
+            break
+        if first_frame is None:
+            log.warning("микрофон молчит - данные не идут")
+            return np.zeros(0, dtype=np.float32)
+
         frames: list[np.ndarray] = []
         speech_seconds = 0.0
         silence_seconds = 0.0
         heard_speech = False
+        # Время на «начни говорить» отсчитываем с момента, когда микрофон
+        # заработал: ожидание его запуска не должно съедать это окно.
         started = time.perf_counter()
 
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=FRAME,
-            device=self.device,
-            callback=callback,
-        ):
+        # Не `with stream`: он запускает поток ещё раз, а этот уже запущен.
+        try:
             while True:
-                try:
-                    frame = chunks.get(timeout=1.0)
-                except queue.Empty:
-                    log.warning("микрофон молчит - данные не идут")
-                    break
+                if first_frame is not None:
+                    frame, first_frame = first_frame, None
+                else:
+                    try:
+                        frame = chunks.get(timeout=FRAME_TIMEOUT_S)
+                    except queue.Empty:
+                        log.warning("микрофон молчит - данные не идут")
+                        break
 
                 frames.append(frame)
                 is_speech = self.vad.probability(frame) >= self.speech_threshold
@@ -273,8 +320,10 @@ class Microphone:
                 if not heard_speech and elapsed >= wait_for_speech:
                     log.info("речи не услышал за %.0f с", wait_for_speech)
                     return np.zeros(0, dtype=np.float32)
+        finally:
+            stream.close()
 
-        audio = np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32)
+        audio =np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32)
         log.info(
             "записано %.2f с, из них речи %.2f с",
             len(audio) / SAMPLE_RATE, speech_seconds,
