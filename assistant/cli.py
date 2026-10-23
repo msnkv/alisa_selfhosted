@@ -416,6 +416,10 @@ def main() -> int:
         "--mic", action="store_true", help="проверить микрофон: показать громкость"
     )
     parser.add_argument(
+        "--mic-test", action="store_true",
+        help="живые цифры с микрофона: уровень, порог, когда начинается речь",
+    )
+    parser.add_argument(
         "--wake", action="store_true",
         help="режим кодовой фразы: ассистент сам просыпается на слово",
     )
@@ -464,6 +468,11 @@ def main() -> int:
 
     if args.mic:
         return check_microphone(cfg)
+
+    if args.mic_test:
+        # Ни ключа, ни моделей: только микрофон. Важно, чтобы работало
+        # и на спутнике, где нет ни torch, ни распознавания.
+        return make_microphone(cfg).monitor()
 
     if args.wake_test:
         # Ни ключа, ни модели тут не нужно - только микрофон и wake word.

@@ -12,7 +12,6 @@ word шалит, удобно проверить всё остальное бе�
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from dataclasses import dataclass
 
@@ -22,15 +21,7 @@ from .config import Config
 
 if TYPE_CHECKING:  # только для подсказок типов
     from .llm import Assistant
-from .phrases import (
-    ACK_PHRASES,
-    AFTER_THINKING_S,
-    FILLER_GAP_S,
-    SEARCH_PHRASES,
-    THINKING_AFTER_S,
-    THINKING_PHRASES,
-    Pool,
-)
+from .phrases import ACK_PHRASES, FILLER_GAP_S, SEARCH_PHRASES, Pool
 from .prompt import FORGOTTEN_REPLY, is_forget
 from .tts import SpeechQueue
 
@@ -93,18 +84,12 @@ class VoiceLoop:
         # прогреве парами «текст, звук» — текст нужен, чтобы в консоли
         # было написано ровно то, что прозвучало.
         self._ack = Pool([])
-        self._thinking = Pool([])
         self._search = Pool([])
         # Очередь звука текущего круга. Нужна заглушке: она обязана идти
         # тем же каналом, что и ответ, иначе два потока дерутся за вывод.
         self._speech = None
-        # Когда заглушка звучала последний раз и какая - чтобы не
-        # частить и чтобы «ищу» не ждало полных восьми секунд.
+        # Когда заглушка звучала последний раз - чтобы не частить.
         self._filler_at = 0.0
-        self._filler_kind = ""
-        # Таймер фразы «думаю» текущего круга: его надо успеть снять,
-        # когда ответ готов, иначе заглушка прозвучит ПОСЛЕ ответа.
-        self._thinking_timer = None
 
     # --- подготовка -------------------------------------------------------
 
@@ -134,7 +119,6 @@ class VoiceLoop:
         # полтора десятка, но все короткие - весь набор занимает доли
         # секунды синтеза.
         self._ack = self._prepare(ACK_PHRASES)
-        self._thinking = self._prepare(THINKING_PHRASES)
         self._search = self._prepare(SEARCH_PHRASES)
         print(f"  синтез речи: {time.perf_counter() - started:.1f} с")
 
@@ -154,11 +138,13 @@ class VoiceLoop:
 
     # --- один круг --------------------------------------------------------
 
-    def _say_filler(self, pool: Pool, kind: str = "search") -> None:
-        """Подать голос, пока ответа нет.
+    def _say_filler(self) -> None:
+        """Подать голос, пока идёт поиск.
 
-        Общая часть для «думаю» и «ищу»: оба набора идут одной дорогой,
-        различаются словами и тем, как долго ждать следующей фразы.
+        Только на вызове инструмента, и это важно: пробовали говорить
+        на каждом вопросе по таймеру - на ответе за полторы секунды
+        это выглядит странно, ответ и так уже на пороге. Заглушка
+        нужна там, где ждать действительно долго.
         """
         speech = self._speech
         if speech is not None and speech.committed:
@@ -167,21 +153,16 @@ class VoiceLoop:
 
         # Не чаще, чем раз в FILLER_GAP_S. Инструмент вызывается по
         # несколько раз на вопрос, и без этого на четырёх вызовах звучало
-        # четыре «секунду, смотрю» подряд. Исключение - первая фраза про
-        # поиск сразу после «думаю»: см. AFTER_THINKING_S.
-        gap = FILLER_GAP_S
-        if self._filler_kind == "thinking" and kind == "search":
-            gap = AFTER_THINKING_S
+        # четыре «секунду, смотрю» подряд.
         now = time.perf_counter()
-        if now - self._filler_at < gap:
+        if now - self._filler_at < FILLER_GAP_S:
             return
 
-        choice = pool.pick()
+        choice = self._search.pick()
         if choice is None:
             return
         text, samples = choice
         self._filler_at = now
-        self._filler_kind = kind
         print(f"  ({text})")
         try:
             # play_async идёт через тот же замок на вывод, что и ответ,
@@ -194,7 +175,7 @@ class VoiceLoop:
     def _on_tool_call(self, name: str, arguments: dict) -> None:
         detail = arguments.get("query") or arguments.get("url") or ""
         print(f"  ... {name}: {detail}")
-        self._say_filler(self._search, "search")
+        self._say_filler()
 
     def listen_and_answer(
         self, *, wait_speech_s: float | None = None
@@ -220,26 +201,7 @@ class VoiceLoop:
             print("  речи не услышал")
             return None
 
-        # Подать голос, не дожидаясь, понадобится ли поиск. Раньше
-        # заглушка звучала только на вызове инструмента, то есть на
-        # простом вопросе человек слышал две секунды тишины и не
-        # понимал, услышали его или нет. Таймер снимается в finally.
         self._filler_at = 0.0
-        self._filler_kind = ""
-        thinking = threading.Timer(
-            THINKING_AFTER_S, self._say_filler, args=(self._thinking, "thinking")
-        )
-        thinking.daemon = True
-        thinking.start()
-        self._thinking_timer = thinking
-        try:
-            return self._answer(audio, timings, after_record)
-        finally:
-            thinking.cancel()
-            self._thinking_timer = None
-
-    def _answer(self, audio, timings: Timings, after_record: float) -> Timings | None:
-        """Распознать, спросить модель, озвучить. Вынесено ради таймера."""
         started = time.perf_counter()
         transcript = self.stt.transcribe(audio)
         timings.stt = time.perf_counter() - started
@@ -307,12 +269,6 @@ class VoiceLoop:
         finally:
             self._speech = None
         timings.llm = time.perf_counter() - started
-        # Ответ есть - заглушке тут больше делать нечего. Снимать таймер
-        # надо именно здесь, а не в finally: без потоковой озвучки ответ
-        # играется ниже и блокирует поток, и сработавший тем временем
-        # таймер поставил бы «Так-так» в очередь ПОСЛЕ ответа.
-        if self._thinking_timer is not None:
-            self._thinking_timer.cancel()
 
         # Что модель сказала по ходу, но вслух не пошло. Печатаем, чтобы
         # было видно: в логах иначе непонятно, куда делись её слова.

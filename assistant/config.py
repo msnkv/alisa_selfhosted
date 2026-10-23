@@ -99,6 +99,10 @@ class MicConfig:
     min_speech_s: float
     max_phrase_s: float
     wait_speech_s: float
+    # Для vad: energy. Порог плавающий, считается от уровня тишины.
+    energy_ratio: float
+    energy_floor: float
+    energy_threshold: float | None
 
 
 @dataclass(frozen=True)
@@ -217,6 +221,13 @@ def load_config(path: Path | None = None) -> Config:
             min_speech_s=float(mic.get("min_speech_s", 0.3)),
             max_phrase_s=float(mic.get("max_phrase_s", 15)),
             wait_speech_s=float(mic.get("wait_speech_s", 6)),
+            energy_ratio=float(mic.get("energy_ratio", 2.0)),
+            energy_floor=float(mic.get("energy_floor", 0.0015)),
+            energy_threshold=(
+                None
+                if mic.get("energy_threshold") is None
+                else float(mic["energy_threshold"])
+            ),
         ),
         wake=WakeConfig(
             enabled=bool(wake.get("enabled", True)),

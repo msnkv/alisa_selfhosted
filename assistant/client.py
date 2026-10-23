@@ -32,7 +32,7 @@ import wave
 
 import numpy as np
 
-from .phrases import AFTER_THINKING_S, FILLER_GAP_S, THINKING_AFTER_S, Pool
+from .phrases import FILLER_AFTER_S, FILLER_GAP_S, Pool
 from .prompt import is_forget
 from .server import encode_wav
 
@@ -169,19 +169,17 @@ class Satellite:
         thread.start()
 
         # Первая фраза - из набора «думаю»: спутник не знает, пойдёт ли
-        # сервер в интернет, а половина вопросов отвечается из знаний
-        # модели за две секунды. Говорить там «смотрю» было бы враньём.
-        # Зато если ответа нет и через четыре секунды - поиск точно идёт,
-        # и дальше уместны именно «ищу» и «проверяю».
-        waits = [THINKING_AFTER_S, AFTER_THINKING_S]
+        # сервер в интернет. Говорить «смотрю», когда поиска может и не
+        # быть, нельзя. Зато если ответа нет и через двенадцать секунд -
+        # поиск точно идёт, и дальше уместны «ищу» и «проверяю».
+        waited = FILLER_AFTER_S
         name = "thinking"
         while True:
-            thread.join(waits[0] if waits else FILLER_GAP_S)
-            if waits:
-                waits.pop(0)
+            thread.join(waited)
             if not thread.is_alive():
                 break
             self.say_phrase(name)
+            waited = FILLER_GAP_S
             name = "search"
 
         if "error" in outcome:
