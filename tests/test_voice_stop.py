@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from assistant.config import VoiceStopConfig
-from assistant.voice_stop import FRAME, RATE, StopDetector, VoiceStop, resample
+from assistant.voice_stop import FRAME, RATE, StopDetector, VoiceStop, find_stop, resample
 
 
 def result(text="стоп", confidence=0.95, duration=0.3):
@@ -40,15 +40,45 @@ class StopDetectorTests(unittest.TestCase):
         detector.samples_seen = 30 * 160
         return detector, rec
 
-    def test_only_confident_standalone_stop_is_accepted(self):
-        detector, _ = self.detector()
-        self.assertTrue(detector.process(self.near, self.zero))
-        for answer in (result("я сказала стоп"), result("стоп стоп"), result("стоп кран"),
-                       result("остановись"), result(confidence=0.7), result(duration=0.05),
-                       result(duration=3), {"text": "стоп"}):
+    def test_any_stop_word_goes_to_verification(self):
+        # «Стоп, стоп» и «так, стоп» — это команда. Раньше первый проход
+        # требовал ровно одно слово и отбрасывал именно повтор после
+        # промаха. Похожие слова теперь отсекает только проверка.
+        for answer in (result(), result("стоп стоп"), result("так стоп"), result("[unk] стоп [unk]")):
+            with self.subTest(answer=answer):
+                detector, _ = self.detector(answer)
+                self.assertTrue(detector.process(self.near, self.zero))
+                detector.verify.assert_called_once()
+
+    def test_first_pass_without_plausible_stop_word_is_not_verified(self):
+        for answer in (result("остановись"), result("[unk]"), result(confidence=0.5),
+                       result(duration=0.05), result(duration=3), {"text": "стоп"}):
             with self.subTest(answer=answer):
                 detector, _ = self.detector(answer)
                 self.assertFalse(detector.process(self.near, self.zero))
+                detector.verify.assert_not_called()
+
+    def test_second_stop_word_gets_its_own_chance(self):
+        detector, _ = self.detector(result("стоп стоп"))
+        detector.verify.side_effect = [False, True]
+        self.assertTrue(detector.process(self.near, self.zero))
+        self.assertEqual(detector.verify.call_count, 2)
+
+    def test_rejections_are_counted_for_the_summary(self):
+        detector, _ = self.detector()
+        detector.verify.return_value = False
+        detector.verify.reason = ("нет слова", "«топ»")
+        with self.assertLogs("assistant.voice_stop", level="INFO") as logs:
+            detector.process(self.near, self.zero)
+        self.assertIn("проверка нет слова «топ»", logs.output[0])
+        self.assertEqual(detector.tally(), "кандидатов «стоп» 1, принято 0, отказы: проверка 1")
+
+    def test_verification_wants_the_word_stop_itself(self):
+        for answer, expected in ((result(), True), (result("так стоп"), True),
+                                 (result("топ"), False), (result("стопка"), False),
+                                 (result("сто пудов"), False), (result(confidence=0.75), False)):
+            with self.subTest(answer=answer):
+                self.assertEqual(find_stop(answer, 0.8)[0] is not None, expected)
 
     def test_partial_result_without_word_confidence_cannot_stop(self):
         detector, rec = self.detector()

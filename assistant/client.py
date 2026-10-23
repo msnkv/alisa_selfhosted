@@ -315,6 +315,10 @@ class Satellite:
                     print("  Голосовой «стоп» был отключён: " + self._voice_stop.error)
                     if self._voice_stop.processed:
                         print("  " + self._voice_stop.summary())
+                elif getattr(getattr(self._voice_stop, "detector", None), "candidates", 0):
+                    # Слышал «стоп», но не засчитал — видно сразу, а не
+                    # только в журнале. Подробности по каждому — там.
+                    print("  [" + self._voice_stop.detector.tally() + "]")
                 self._voice_stop = None
             self._response_cancel = None
             try:

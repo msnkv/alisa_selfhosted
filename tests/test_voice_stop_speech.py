@@ -1,22 +1,16 @@
 """Необязательный прогон настоящих AEC/Vosk на локальных WAV, без устройств.
 
-Файлы в models/voice-stop-check: stop.wav (отдельное «стоп»), alisa.wav
-(речь, включая слово «стоп»), negative.wav (похожие слова без команды).
-Если модели или записей нет, тесты пропускаются; ничего не скачивается.
+Файлы в models/voice-stop-check: stop.wav (отдельное «стоп»), stop_twice.wav
+(«стоп, стоп»), alisa.wav (речь, включая слово «стоп»), negative.wav
+(похожие слова без команды). Если модели или записей нет, тесты
+пропускаются; ничего не скачивается.
 
-Локальный набор: официальная vosk-model-small-ru-0.22 в models/.
-WAV сгенерированы на macOS командой /usr/bin/say -v Milena -o <путь>
---data-format=LEI16@<частота> '<текст>' (только в файл, без динамика):
-  stop.wav, 16000: Стоп.
-  alisa.wav, 48000: Сейчас я расскажу тебе историю про кота, который жил
-    в маленьком доме у леса. Однажды он услышал громкий голос. Стоп!
-    Подожди меня, сказала девочка. Они вместе пошли дальше по тропинке.
-  negative.wav, 16000: Где лежит мой телефон? Сколько сейчас времени?
-    Пожалуйста, продолжай рассказ. Стол. Сто. Суп. Потоп. Кто там?
-    Что случилось? Не останавливайся.
-Все переносы в тексте заменяются пробелами. Другой синтез/диктор может
-изменить распознавание: это конкретный регрессионный набор, не универсальный
-замер качества. Модель и WAV остаются в игнорируемой папке models/.
+Локальный набор: официальная vosk-model-small-ru-0.22 в models/. WAV
+делает tests/make_voice_stop_wavs.py нашим Silero: Алиса своим голосом,
+человек — другим. Первоначальный набор был сгенерирован на macOS
+командой say -v Milena, тексты те же. Другой синтез/диктор может изменить
+распознавание: это конкретный регрессионный набор, не универсальный замер
+качества. Модель и WAV остаются в игнорируемой папке models/.
 """
 
 import json
@@ -45,14 +39,17 @@ class RecordedSpeechTests(unittest.TestCase):
         SetLogLevel(-1)
         cls.model = Model(str(model))
         cls.processor = AudioProcessor
-        cls.recordings = {}
-        for name in ("stop", "alisa", "negative"):
-            with wave.open(str(audio / f"{name}.wav"), "rb") as handle:
-                assert handle.getnchannels() == 1 and handle.getsampwidth() == 2
-                samples = np.frombuffer(handle.readframes(handle.getnframes()), dtype="<i2").astype(np.float32) / 32768
-                if len(samples) < 1600:
-                    raise ValueError(f"пустая или слишком короткая запись {name}")
-                cls.recordings[name] = resample(samples, handle.getframerate(), RATE)
+        cls.audio = audio
+        cls.recordings = {name: cls.load(name) for name in ("stop", "alisa", "negative")}
+
+    @classmethod
+    def load(cls, name):
+        with wave.open(str(cls.audio / f"{name}.wav"), "rb") as handle:
+            assert handle.getnchannels() == 1 and handle.getsampwidth() == 2
+            samples = np.frombuffer(handle.readframes(handle.getnframes()), dtype="<i2").astype(np.float32) / 32768
+            if len(samples) < 1600:
+                raise ValueError(f"пустая или слишком короткая запись {name}")
+            return resample(samples, handle.getframerate(), RATE)
 
     def run_audio(self, near, far):
         from vosk import KaldiRecognizer
@@ -99,6 +96,23 @@ class RecordedSpeechTests(unittest.TestCase):
         # Консервативное подтверждение допускает пропуски. На этой записи
         # (тот же синтетический голос для обеих сторон) распознаны 2 из 3.
         # Это минимальный порог регрессии, НЕ обещание 100% распознавания.
+        self.assertGreaterEqual(recognised, 2)
+
+    def test_repeated_stop_over_alisa_speech(self):
+        # «Стоп, стоп» после промаха. До 23.10.2026 первый проход требовал
+        # ровно одно слово и не пропускал это ни разу.
+        if not (self.audio / "stop_twice.wav").is_file():
+            self.skipTest("нет stop_twice.wav, перегенерируй make_voice_stop_wavs.py")
+        far = self.reference("alisa")
+        voice = self.load("stop_twice")
+        recognised = 0
+        for second in (4, 6, 8):
+            near = self.echo(far)
+            at = RATE * second
+            near[at:at+len(voice)] += voice
+            found = self.run_audio(near, far)
+            self.assertLessEqual(len(found), 1, f"команда на {second} секунде: {found}")
+            recognised += bool(found)
         self.assertGreaterEqual(recognised, 2)
 
     def test_alisa_echo_alone_does_not_stop(self):

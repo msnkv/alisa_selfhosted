@@ -12,7 +12,7 @@ import queue
 import re
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 
 import numpy as np
 
@@ -26,17 +26,33 @@ QUEUE_FRAMES = 300
 ECHO_TAIL_S = 0.5
 WARMUP_S = 0.8
 MIN_LEVEL = 0.003
+FIRST_PASS_CONFIDENCE = 0.6
+# Сколько звука вокруг слова отдаём повторной проверке.
+VERIFY_BEFORE_S = 0.15
+VERIFY_AFTER_S = 0.15
 OWN_STOP = re.compile(r"\bстоп\b", re.IGNORECASE)
 
 
-def is_stop(result, min_confidence):
-    words = result.get("result") or []
-    return (
-        result.get("text", "").strip().lower() == "стоп"
-        and len(words) == 1 and words[0].get("word") == "стоп"
-        and words[0].get("conf", 0) >= min_confidence
-        and 0.12 <= words[0].get("end", 0) - words[0].get("start", 0) <= 1.5
-    )
+def find_stop(result, min_confidence):
+    """Самое уверенное «стоп» в распознанном.
+
+    Возвращает (слово, None) или (None, (вид отказа, подробность)).
+    Соседние слова не мешают: «стоп, стоп» и «так, стоп» — тоже команда.
+    Раньше требовалось «ровно одно слово», и замер 23.10.2026 показал, что
+    так отбрасывается как раз повторное «стоп, стоп» после промаха.
+    """
+    text = result.get("text", "").strip().lower()
+    words = [w for w in result.get("result") or [] if w.get("word") == "стоп"]
+    if not words:
+        return None, ("нет слова", f"«{text}»")
+    fit = [w for w in words if 0.12 <= w.get("end", 0) - w.get("start", 0) <= 1.5]
+    if not fit:
+        duration = words[0].get("end", 0) - words[0].get("start", 0)
+        return None, ("длительность", f"{duration:.2f} с")
+    best = max(fit, key=lambda w: w.get("conf", 0))
+    if best.get("conf", 0) < min_confidence:
+        return None, ("уверенность", f"{best.get('conf', 0):.2f} в «{text}»")
+    return best, None
 
 
 def make_verifier(model, min_confidence):
@@ -48,9 +64,21 @@ def make_verifier(model, min_confidence):
     def verify(pcm):
         recognizer.Reset()
         recognizer.AcceptWaveform(pcm + bytes(16000))  # полсекунды тишины для конца фразы
-        return is_stop(json.loads(recognizer.FinalResult()), min_confidence)
+        result = json.loads(recognizer.FinalResult())
+        # Для замера: что именно услышала проверка, если отказала.
+        verify.reason = find_stop(result, min_confidence)[1]
+        return verify.reason is None
 
+    verify.reason = None
     return verify
+
+
+def describe(result):
+    """«стоп 0.93 0.31с, [unk] 1.00 0.80с» — для журнала кандидатов."""
+    return ", ".join(
+        f"{w.get('word')} {w.get('conf', 0):.2f} {w.get('end', 0) - w.get('start', 0):.2f}с"
+        for w in result.get("result") or []
+    ) or "«" + result.get("text", "") + "»"
 
 
 def resample(samples, source_rate, target_rate):
@@ -86,6 +114,11 @@ class StopDetector:
         self.samples_seen = 0
         self.verifies = 0
         self.verify_worst = 0.0
+        # Замер: сколько раз первый проход услышал «стоп» и почему не
+        # засчитал. Без этого «сработало с третьего раза» не разобрать.
+        self.candidates = 0
+        self.accepted = 0
+        self.rejections = Counter()
 
     def reset(self):
         self.recognizer.Reset()
@@ -123,22 +156,74 @@ class StopDetector:
             return False
         result = json.loads(self.recognizer.Result())
         accepted = False
-        if is_stop(result, self.min_confidence) and self.peak >= MIN_LEVEL:
-            word = result["result"][0]
-            recorded = np.concatenate(self.audio)
-            offset = self.samples_seen - len(recorded)
-            start = round(word["start"] * 16000) - 2400
-            end = round(word["end"] * 16000) + 2400
-            if start >= offset - 2400 and end <= self.samples_seen + 2400:
-                snippet = recorded[max(0, start - offset):max(0, end - offset)]
-                if len(snippet) >= 1600:
-                    pcm = (np.clip(snippet, -1, 1) * 32767).astype("<i2").tobytes()
-                    began = time.perf_counter()
-                    accepted = self.verify(pcm)
-                    self.verifies += 1
-                    self.verify_worst = max(self.verify_worst, time.perf_counter() - began)
+        # Кандидат — всё, где первый проход вообще услышал «стоп». Фразы
+        # из одного «[unk]» — это обычный шум и речь, их не считаем.
+        if any(w.get("word") == "стоп" for w in result.get("result") or []):
+            reason = self.judge(result)
+            self.candidates += 1
+            if reason is None:
+                self.accepted += 1
+                accepted = True
+            else:
+                self.rejections[reason[0]] += 1
+            log.info("стоп-кандидат: %s, громкость %.4f -> %s",
+                     describe(result), self.peak, "принят" if accepted else " ".join(reason))
         self.reset()
         return accepted
+
+    def judge(self, result):
+        """(вид, подробность) отказа или None, если «стоп» засчитан."""
+        # Уверенность первого прохода почти ничего не значит: грамматика
+        # из одного слова ставит 1.00 и на «что?», и на «штопор». Поэтому
+        # порог тут низкий, а различает слова повторная проверка.
+        _, reason = find_stop(result, FIRST_PASS_CONFIDENCE)
+        if reason is not None:
+            return reason
+        if self.peak < MIN_LEVEL:
+            return "тихо", f"{self.peak:.4f}"
+        # «Стоп, стоп» — два шанса: проверка нередко слышит одно из них
+        # как «топ» или «сколько», а второе — как надо.
+        words = sorted(
+            (w for w in result["result"] if w.get("word") == "стоп"
+             and w.get("conf", 0) >= FIRST_PASS_CONFIDENCE
+             and 0.12 <= w.get("end", 0) - w.get("start", 0) <= 1.5),
+            key=lambda w: -w.get("conf", 0),
+        )[:2]
+        for word in words:
+            reason = self.verify_word(word)
+            if reason is None:
+                return None
+        return reason
+
+    def verify_word(self, word):
+        """Повторная проверка одного слова по очищенному звуку вокруг него."""
+        recorded = np.concatenate(self.audio)
+        offset = self.samples_seen - len(recorded)
+        before = round(VERIFY_BEFORE_S * 16000)
+        start = round(word["start"] * 16000) - before
+        end = round(word["end"] * 16000) + round(VERIFY_AFTER_S * 16000)
+        if not (start >= offset - before and end <= self.samples_seen + 2400):
+            return "нет звука", "слово вне буфера"
+        snippet = recorded[max(0, start - offset):max(0, end - offset)]
+        if len(snippet) < 1600:
+            return "нет звука", "кусок короче 0,1 с"
+        pcm = (np.clip(snippet, -1, 1) * 32767).astype("<i2").tobytes()
+        began = time.perf_counter()
+        confirmed = self.verify(pcm)
+        self.verifies += 1
+        self.verify_worst = max(self.verify_worst, time.perf_counter() - began)
+        if confirmed:
+            return None
+        reason = getattr(self.verify, "reason", None)
+        kind, detail = reason if isinstance(reason, tuple) else ("отказ", "")
+        return "проверка", f"{kind} {detail}".strip()
+
+    def tally(self):
+        """«кандидатов 3, принято 1, отказы: первый 2» — для сводки."""
+        line = f"кандидатов «стоп» {self.candidates}, принято {self.accepted}"
+        if self.rejections:
+            line += ", отказы: " + ", ".join(f"{k} {v}" for k, v in self.rejections.most_common())
+        return line
 
 
 class VoiceStop:
@@ -301,6 +386,8 @@ class VoiceStop:
         if self.detector is not None and self.detector.verifies:
             line += (f", проверок слова {self.detector.verifies}, худшая "
                      f"{self.detector.verify_worst * 1000:.0f} мс")
+        if self.detector is not None:
+            line += "; " + self.detector.tally()
         return line
 
 
