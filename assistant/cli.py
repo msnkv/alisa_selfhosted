@@ -15,6 +15,7 @@ import argparse
 import sys
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # только для подсказок типов
@@ -23,7 +24,7 @@ if TYPE_CHECKING:  # только для подсказок типов
 from .config import ROOT, load_config, setup_logging
 from .mic import make_microphone
 from .history import describe as describe_dialogue
-from .prompt import build_system_prompt, human_now, is_forget
+from .prompt import build_system_prompt, clean_for_speech, human_now, is_forget
 from .stt import make_stt
 from .tts import SAMPLE_TEXT, SPEAKERS, SpeechQueue, describe_devices, make_tts
 from .server import serve
@@ -224,6 +225,50 @@ def check_microphone(cfg) -> int:
     return 0
 
 
+def speak_text(tts, text: str, speaker: str | None, save: str | None) -> int:
+    """Озвучить произвольный текст. Удобно для подбора фраз и голосов.
+
+    Текст прогоняется через ту же чистку, что и ответы модели, иначе
+    звёздочки и дефисы списка синтезатор читает вслух как мусор.
+    """
+    if tts is None:
+        print("Озвучка выключена: поставь tts.enabled в config.yaml")
+        return 1
+
+    clean = clean_for_speech(text)
+    if not clean:
+        print("Нечего говорить")
+        return 1
+    if clean != text:
+        print(f"  после чистки: {clean}")
+
+    # Прогрев до замера: иначе в «скорость синтеза» попадёт загрузка
+    # модели — это пять секунд, и цифра получается бессмысленной.
+    loading = time.perf_counter()
+    tts.warm_up()
+    print(f"  модель готова за {time.perf_counter() - loading:.1f} с")
+
+    started = time.perf_counter()
+    samples = tts.synthesize(clean, speaker=speaker)
+    seconds = len(samples) / tts.sample_rate
+    elapsed = time.perf_counter() - started
+    print(
+        f"  голос {speaker or tts.speaker}: {seconds:.1f} с речи за"
+        f" {elapsed:.2f} с (быстрее реального времени в"
+        f" {seconds / elapsed:.1f} раза)"
+    )
+
+    if save:
+        path = Path(save)
+        if not path.is_absolute():
+            path = ROOT / path
+        tts.save(clean, path, speaker=speaker)
+        print(f"  сохранено: {path}")
+
+    tts.play(samples)
+    return 0
+
+
 def render_voices(tts, text: str) -> int:
     """Озвучивает одну фразу всеми голосами, сохраняет и проигрывает.
 
@@ -348,6 +393,16 @@ def main() -> int:
         "--no-web", action="store_true", help="ответить без доступа в интернет"
     )
     parser.add_argument(
+        "--say", metavar="ТЕКСТ", help="озвучить свой текст и ничего больше"
+    )
+    parser.add_argument(
+        "--speaker", metavar="ГОЛОС",
+        help=f"каким голосом (для --say): {', '.join(SPEAKERS)}",
+    )
+    parser.add_argument(
+        "--save", metavar="ФАЙЛ", help="сохранить озвученное в wav (для --say)"
+    )
+    parser.add_argument(
         "--voices", nargs="?", const=SAMPLE_TEXT, metavar="ФРАЗА",
         help="озвучить фразу всеми голосами и сохранить в samples/",
     )
@@ -397,6 +452,12 @@ def main() -> int:
 
     # Озвучку создаём, но модель она подгрузит только когда понадобится.
     tts = make_tts(cfg) if cfg.tts.enabled else None
+
+    if args.say:
+        if args.speaker and args.speaker not in SPEAKERS:
+            print(f"Нет такого голоса. Есть: {', '.join(SPEAKERS)}")
+            return 1
+        return speak_text(tts, args.say, args.speaker, args.save)
 
     if args.voices:
         return render_voices(tts, args.voices)
