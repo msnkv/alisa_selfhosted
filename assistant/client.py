@@ -32,6 +32,7 @@ import wave
 
 import numpy as np
 
+from .phrases import AFTER_THINKING_S, FILLER_GAP_S, THINKING_AFTER_S, Pool
 from .prompt import is_forget
 from .server import encode_wav
 
@@ -41,12 +42,6 @@ EXIT_WORDS = {"выход", "exit", "quit", "q"}
 
 # Запись с микрофона у нас всегда в этой частоте, см. mic.py.
 RECORD_RATE = 16000
-
-# Столько тишины человек терпит спокойно; дальше надо подать голос.
-FILLER_AFTER_S = 1.5
-# И повторять, пока идёт поиск: вопрос с несколькими попытками занимает
-# до полуминуты, и молчание всё это время выглядит как поломка.
-FILLER_GAP_S = 8.0
 
 
 def decode_wav(data: bytes) -> tuple[np.ndarray, int]:
@@ -74,14 +69,11 @@ class Satellite:
         self.url = url.rstrip("/")
         self.microphone = microphone
         self.wake = wake
-        # Служебные фразы в голосе ассистента: заглушка «секунду,
-        # смотрю» и отзыв «да?». Синтеза здесь нет, поэтому их готовит
-        # сервер, а спутник забирает один раз при запуске и держит в
-        # памяти — играть их надо мгновенно.
-        self.filler = None
-        self.filler_rate = 0
-        self.ack = None
-        self.ack_rate = 0
+        # Служебные фразы в голосе ассистента: отзыв на кодовую фразу и
+        # заглушки. Синтеза здесь нет, поэтому их готовит сервер, а
+        # спутник забирает один раз при запуске и держит в памяти —
+        # играть их надо мгновенно. Наборы и правила выбора — phrases.py.
+        self.phrases: dict[str, Pool] = {}
 
     # --- обмен с сервером -------------------------------------------------
 
@@ -110,19 +102,44 @@ class Satellite:
         return True
 
     def load_phrases(self) -> None:
-        """Забирает у сервера заглушку и отзыв."""
-        for path, field, name in (
-            ("/filler.wav", "filler", "заглушки"),
-            ("/ack.wav", "ack", "отзыва"),
-        ):
-            try:
-                with urllib.request.urlopen(self.url + path, timeout=10) as answer:
-                    samples, rate = decode_wav(answer.read())
-                setattr(self, field, samples)
-                setattr(self, field + "_rate", rate)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("%s забрать не удалось: %s", name, exc)
-                print(f"  ({name} не будет: сервер её не отдал)")
+        """Забирает у сервера служебные фразы: отзыв и заглушки."""
+        import base64
+
+        try:
+            with urllib.request.urlopen(self.url + "/phrases", timeout=10) as answer:
+                data = json.loads(answer.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("служебные фразы забрать не удалось: %s", exc)
+            print("  (служебных фраз не будет: сервер их не отдал)")
+            return
+
+        total = 0
+        for name, items in data.items():
+            ready = []
+            for item in items:
+                try:
+                    samples, rate = decode_wav(base64.b64decode(item["wav"]))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("фраза «%s» не разобралась: %s", item.get("text"), exc)
+                    continue
+                ready.append((item.get("text", ""), samples, rate))
+            self.phrases[name] = Pool(ready)
+            total += len(ready)
+        log.info("служебных фраз получено: %d", total)
+
+    def say_phrase(self, name: str) -> bool:
+        """Говорит фразу из набора. False — набора нет, сказать нечем."""
+        pool = self.phrases.get(name)
+        choice = pool.pick() if pool is not None else None
+        if choice is None:
+            return False
+        text, samples, rate = choice
+        print(f"  ({text})")
+        try:
+            self.play(samples, rate)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("фраза не прозвучала: %s", exc)
+        return True
 
     # --- звук -------------------------------------------------------------
 
@@ -151,17 +168,21 @@ class Satellite:
         thread = threading.Thread(target=worker, name="ask", daemon=True)
         thread.start()
 
-        waited = FILLER_AFTER_S
+        # Первая фраза - из набора «думаю»: спутник не знает, пойдёт ли
+        # сервер в интернет, а половина вопросов отвечается из знаний
+        # модели за две секунды. Говорить там «смотрю» было бы враньём.
+        # Зато если ответа нет и через четыре секунды - поиск точно идёт,
+        # и дальше уместны именно «ищу» и «проверяю».
+        waits = [THINKING_AFTER_S, AFTER_THINKING_S]
+        name = "thinking"
         while True:
-            thread.join(waited)
+            thread.join(waits[0] if waits else FILLER_GAP_S)
+            if waits:
+                waits.pop(0)
             if not thread.is_alive():
                 break
-            if self.filler is None:
-                # Заглушки нет - просто ждём дальше, но молча.
-                waited = FILLER_GAP_S
-                continue
-            self.play(self.filler, self.filler_rate)
-            waited = FILLER_GAP_S
+            self.say_phrase(name)
+            name = "search"
 
         if "error" in outcome:
             raise outcome["error"]
@@ -282,12 +303,8 @@ class Satellite:
             # Отзыв вслух, а не только в консоль. Без него из другого
             # конца комнаты непонятно, услышал он кодовую фразу или нет,
             # и человек повторяет её впустую.
-            print("  да?")
-            if self.ack is not None:
-                try:
-                    self.play(self.ack, self.ack_rate)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("отзыв не прозвучал: %s", exc)
+            if not self.say_phrase("ack"):
+                print("  да?")
 
             wait = None
             while True:

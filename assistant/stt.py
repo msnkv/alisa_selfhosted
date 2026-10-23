@@ -124,11 +124,44 @@ class WhisperSTT:
         attempts.append(("cpu", "int8"))
         return attempts
 
+    def _open(self, device: str, compute_type: str, download_root: str | None):
+        """Создаёт модель, сперва пробуя обойтись без сети.
+
+        Главное тут - `local_files_only=True` на первой попытке.
+        faster-whisper по имени модели всегда ходит на huggingface
+        сверить версию, даже когда всё давно скачано. Обычно это
+        полсекунды, но huggingface из России открывается не всегда, и
+        при полуживом соединении проверка висит до таймаута: прогрев,
+        который занимает четыре секунды, занял сто тринадцать. Теперь
+        сеть нужна ровно один раз - когда модели ещё нет на диске.
+        """
+        from faster_whisper import WhisperModel
+
+        try:
+            return WhisperModel(
+                self.model_name,
+                device=device,
+                compute_type=compute_type,
+                download_root=download_root,
+                local_files_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info(
+                "локальной копии %s нет (%s), качаю с huggingface",
+                self.model_name, type(exc).__name__,
+            )
+            print(f"  (качаю модель распознавания {self.model_name}, это надолго)")
+            return WhisperModel(
+                self.model_name,
+                device=device,
+                compute_type=compute_type,
+                download_root=download_root,
+            )
+
     @property
     def model(self):
         if self._model is None:
             _register_cuda_dlls()
-            from faster_whisper import WhisperModel
 
             download_root = str(self.models_dir / "whisper") if self.models_dir else None
             silence = np.zeros(SAMPLE_RATE, dtype=np.float32)
@@ -137,12 +170,7 @@ class WhisperSTT:
             for device, compute_type in self._attempts():
                 started = time.perf_counter()
                 try:
-                    candidate = WhisperModel(
-                        self.model_name,
-                        device=device,
-                        compute_type=compute_type,
-                        download_root=download_root,
-                    )
+                    candidate = self._open(device, compute_type, download_root)
                     # Пробное распознавание обязательно: ошибки CUDA
                     # всплывают при вычислении, а не при загрузке модели.
                     segments, _ = candidate.transcribe(silence, language=self.language)

@@ -153,6 +153,23 @@ class SileroTTS:
         )
         return samples
 
+    def say_short(self, text: str) -> np.ndarray:
+        """Синтез служебной фразы: то же самое, но без тишины в конце.
+
+        Silero дописывает в конец каждой фразы около четверти секунды
+        тишины. В ответе это незаметно и даже к месту, а в служебной
+        фразе — прямая задержка: «Ммм, сейчас» звучит перед ответом и
+        всё это время держит замок на выводе звука. Замерено: хвост
+        ровно 0,23–0,27 с у всех фраз, полезный звук кончается раньше.
+        Восемь сотых оставляем, чтобы не звучало обрубленным.
+        """
+        samples = self.synthesize(text)
+        loud = np.flatnonzero(np.abs(samples) > 0.01)
+        if not len(loud):
+            return samples
+        end = int(loud[-1]) + int(0.08 * self.sample_rate)
+        return samples[: min(end, len(samples))]
+
     # --- вывод ------------------------------------------------------------
 
     def say(self, text: str, speaker: str | None = None) -> None:

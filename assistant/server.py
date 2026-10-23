@@ -82,8 +82,8 @@ class Brain:
         # Синтеза у него нет и быть не должно, но молчать он тоже не
         # может: без отзыва непонятно, услышал ли он кодовую фразу, а
         # без заглушки пятнадцать секунд поиска выглядят как поломка.
-        self.filler: bytes | None = None
-        self.ack: bytes | None = None
+        # Наборы те же, что у голосового цикла на ПК, см. phrases.py.
+        self.phrases: dict[str, list[tuple[str, bytes]]] = {}
 
     def warm_up(self) -> None:
         print("Готовлю модели...")
@@ -92,15 +92,32 @@ class Brain:
             self.stt.warm_up()
             print(f"  распознавание: {time.perf_counter() - started:.1f} с")
         if self.tts is not None:
-            from .voice import ACK_PHRASE, FILLER_PHRASE
+            from .phrases import POOLS
 
             started = time.perf_counter()
             self.tts.warm_up()
-            for phrase, field in ((FILLER_PHRASE, "filler"), (ACK_PHRASE, "ack")):
-                samples = self.tts.synthesize(phrase)
-                if len(samples):
-                    setattr(self, field, encode_wav(samples, self.tts.sample_rate))
+            for name, texts in POOLS.items():
+                ready = []
+                for text in texts:
+                    samples = self.tts.say_short(text)
+                    if len(samples):
+                        ready.append((text, encode_wav(samples, self.tts.sample_rate)))
+                self.phrases[name] = ready
             print(f"  синтез речи: {time.perf_counter() - started:.1f} с")
+
+    def phrases_json(self) -> dict:
+        """Все служебные фразы для спутника: текст и звук в base64.
+
+        Одним запросом, а не по файлу на фразу: их полтора десятка, и
+        спутник забирает их один раз при запуске.
+        """
+        return {
+            name: [
+                {"text": text, "wav": base64.b64encode(blob).decode("ascii")}
+                for text, blob in ready
+            ]
+            for name, ready in self.phrases.items()
+        }
 
     def answer_audio(self, body: bytes, suffix: str) -> dict:
         """Звук с вопросом на входе, ответ текстом и звуком на выходе."""
@@ -408,14 +425,20 @@ def make_handler(brain: Brain, token: str):
             if parts.path == "/health":
                 self._send(200, b"ok\n", "text/plain; charset=utf-8")
                 return
-            if parts.path in ("/filler.wav", "/ack.wav"):
+            if parts.path == "/phrases":
                 # Спутник забирает их один раз при запуске и держит в
                 # памяти: играть надо мгновенно, а не качать каждый раз.
-                blob = brain.filler if parts.path == "/filler.wav" else brain.ack
-                if blob is None:
+                self._send_json(200, brain.phrases_json())
+                return
+            if parts.path in ("/filler.wav", "/ack.wav"):
+                # Остались для отладки через браузер и curl: по одной
+                # фразе из набора. Спутник ходит в /phrases.
+                name = "ack" if parts.path == "/ack.wav" else "search"
+                ready = brain.phrases.get(name) or []
+                if not ready:
                     self._send(404, b"no audio\n", "text/plain; charset=utf-8")
                     return
-                self._send(200, blob, "audio/wav")
+                self._send(200, ready[0][1], "audio/wav")
                 return
             if parts.path in ("/", "/index.html"):
                 if not self._allowed(query):
