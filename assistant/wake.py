@@ -234,6 +234,7 @@ class VoskWakeWord:
         phrase: str = "алиса тян",
         variants: tuple[str, ...] = (),
         model_dir: Path | None = None,
+        models_dir: Path | None = None,
         language: str = "ru",
         min_confidence: float = 0.8,
         device: int | str | None = None,
@@ -246,6 +247,7 @@ class VoskWakeWord:
             dict.fromkeys([self.phrase, *(v.strip().lower() for v in variants if v)])
         )
         self.model_dir = model_dir
+        self.models_dir = models_dir
         self.language = language
         self.min_confidence = min_confidence
         self.device = device
@@ -258,6 +260,23 @@ class VoskWakeWord:
 
     # --- загрузка ---------------------------------------------------------
 
+    def find_local(self) -> Path | None:
+        """Уже скачанная модель рядом с проектом.
+
+        Нужно не для красоты. Сама vosk качает модель с alphacephei.com,
+        и это не везде доступно: на спутнике запуск падал по таймауту,
+        хотя на основном ПК та же модель скачалась — там был VPN.
+        Поэтому папку с моделью достаточно положить в `models/`, и она
+        подхватится без всякой сети.
+        """
+        if self.model_dir and self.model_dir.is_dir():
+            return self.model_dir
+        if self.models_dir and self.models_dir.is_dir():
+            for path in sorted(self.models_dir.glob("vosk-model-*")):
+                if path.is_dir():
+                    return path
+        return None
+
     @property
     def model(self):
         if self._model is None:
@@ -266,12 +285,27 @@ class VoskWakeWord:
             # Без этого kaldi сыплет в stderr десятки строк на загрузке.
             SetLogLevel(-1)
             started = time.perf_counter()
-            if self.model_dir and self.model_dir.is_dir():
-                self._model = Model(model_path=str(self.model_dir))
-                where = str(self.model_dir)
+            local = self.find_local()
+            if local is not None:
+                self._model = Model(model_path=str(local))
+                where = str(local)
             else:
-                # Сама скачает маленькую модель языка в кэш пользователя.
-                self._model = Model(lang=self.language)
+                try:
+                    # Сама скачает модель языка в кэш пользователя.
+                    self._model = Model(lang=self.language)
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        "не удалось получить модель кодовой фразы "
+                        f"({type(exc).__name__}: {exc}).\n"
+                        "Скачать её можно только с alphacephei.com, и это "
+                        "доступно не из любой сети.\n"
+                        "Обходной путь: взять уже скачанную папку модели "
+                        "с другой машины\n(обычно лежит в "
+                        "C:\\Users\\ИМЯ\\.cache\\vosk) и положить её "
+                        "в папку models/ рядом с config.yaml.\n"
+                        "Она подхватится сама; можно и указать путь явно "
+                        "в wake.model_dir."
+                    ) from exc
                 where = "кэш vosk"
             log.info(
                 "модель vosk (%s) загружена за %.2f с из %s",
@@ -499,6 +533,7 @@ def make_wake_word(cfg) -> WakeWord:
             phrase=cfg.wake.phrase,
             variants=tuple(cfg.wake.variants),
             model_dir=cfg.wake.model_dir,
+            models_dir=cfg.models_dir,
             language=cfg.wake.language,
             min_confidence=cfg.wake.min_confidence,
             device=cfg.wake.input_device,
