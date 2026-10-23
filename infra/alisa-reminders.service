@@ -1,0 +1,17 @@
+[Unit]
+Description=Alisa persistent Telegram reminders
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Заменить пользователя и пути под свою постоянно включённую машину.
+User=alisa
+WorkingDirectory=/opt/alisa_selfhosted
+ExecStart=/opt/alisa_selfhosted/.venv/bin/python -m assistant.reminders
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -34,6 +34,7 @@ from .prompt import (
 )
 from .search import EMPTY_RESULT_MARKER, SearchTools, make_backend
 from .streaming import check_cancelled
+from .reminder_dialogue import ReminderDialogue, INTENT as REMINDER_INTENT
 
 log = logging.getLogger(__name__)
 
@@ -144,6 +145,7 @@ class Assistant:
         # «забудь». Повторять фразу перед каждой репликой было бы странно.
         self.long_form = False
         self.session_id = "local"
+        self.reminders = ReminderDialogue(cfg.reminders)
 
         # Журнал диалогов: по строке JSON на обмен, для разбора потом.
         # Пишется здесь, а не в голосовом цикле, намеренно: через ask
@@ -204,6 +206,7 @@ class Assistant:
         session.history = []
         session.long_form = False
         session.session_id = session_id
+        session.reminders = ReminderDialogue(self.cfg.reminders)
         session.dialogue = DialogueLog(self.dialogue.path, enabled=self.dialogue.enabled)
         return session
 
@@ -240,6 +243,33 @@ class Assistant:
         # Разговор включается и выключается словами и держится между
         # репликами.
         check_cancelled(cancel_event)
+        reminder_started = time.perf_counter()
+
+        def extract_reminder(messages, schema):
+            extra = {"cancel_event": cancel_event} if cancel_event is not None else {}
+            _, calls, _ = self._step(messages, [schema], None, 600, **extra)
+            if len(calls) != 1:
+                return None
+            name, data = self._parse_call(calls[0])
+            return data if name == "propose_reminder" else None
+
+        reminder_text = self.reminders.handle(question, self.session_id, extract_reminder, cancel_event)
+        if reminder_text is not None:
+            answer = Answer(reminder_text, time.perf_counter() - reminder_started, tools_used=["reminder"])
+            try:
+                check_cancelled(cancel_event)
+                if on_sentence is not None:
+                    on_sentence(reminder_text)
+                if on_step is not None:
+                    on_step(False)
+                check_cancelled(cancel_event)
+            except BaseException:
+                # Не оставляем подтверждение, если предпросмотр не дошёл.
+                self.reminders.reset()
+                raise
+            self._remember(question, answer.text)
+            self._log_turn(question, answer, None, False, False)
+            return answer
         if long_form_cancel(question):
             self.long_form = False
         elif long_form_request(question):
@@ -427,6 +457,7 @@ class Assistant:
         self.history.clear()
         # Разговор тоже заканчивается: «забудь» — это сброс всего.
         self.long_form = False
+        self.reminders.reset()
         # И в журнале дальше идёт уже другая беседа.
         self.dialogue.new_conversation()
 
@@ -438,6 +469,8 @@ class Assistant:
         с первой фразы. Иначе сказку пришлось бы слушать после минуты
         тишины — сперва вся генерация, и только потом звук.
         """
+        if REMINDER_INTENT.search(question) or self.reminders.pending or self.reminders.context:
+            return False
         if long_form_cancel(question):
             return False
         return self.long_form or long_form_request(question)

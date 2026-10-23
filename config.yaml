@@ -268,6 +268,15 @@ mic:
   # null - плавающий, так и надо в обычном случае.
   energy_threshold: null
 
+reminders:
+  # Пустой URL отключает напоминания. Указать в config.local.yaml на ПК Алисы.
+  url: ""
+  # Следующие настройки нужны на машине службы python -m assistant.reminders.
+  host: "127.0.0.1"
+  port: 8766
+  database: "state/reminders.sqlite3"
+  timezone: "Europe/Moscow"
+
 voice_stop:
   # Спутник слушает отдельное «стоп» во время ответа с WebRTC AEC.
   # При отказе AEC голосовая отмена отключается, Ctrl+C остаётся.

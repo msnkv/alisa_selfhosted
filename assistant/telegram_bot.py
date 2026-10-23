@@ -165,7 +165,9 @@ def handle_message(message: dict, telegram: Telegram, alice: AliceServer, owner:
         return
     if command in ("/start", "/help"):
         telegram.text(chat_id, "Пришли текст или голосовое. Верну ответ Алисы текстом и войсом. "
-                      "Чтобы сбросить разговор, напиши «забудь».")
+                      "Чтобы сбросить разговор, напиши «забудь». "
+                      "Если подключена служба напоминаний: «напомни завтра в семь утра…», "
+                      "проверь точное время и ответь «подтверждаю». Список: «мои напоминания».")
         return
     try:
         if message.get("voice"):

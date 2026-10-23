@@ -56,6 +56,7 @@ openwakeword==0.6.0
 # wake.engine, openWakeWord остаётся запасным путём.
 vosk==0.3.45
 pywebrtc-audio==0.2.0  # голосовой стоп на спутнике, готовые колёса Windows x64
+tzdata==2026.5         # часовые пояса напоминаний, в том числе на Windows
 
 # --- Синтез: ПРОБОВАЛИ, НЕ ПЕРЕШЛИ ---
 # vosk-tts: локальный, Apache 2.0 (у Silero CC BY-NC), пять голосов,
