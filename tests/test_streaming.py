@@ -8,6 +8,7 @@ import numpy as np
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 import unittest
+from dataclasses import replace
 
 import test_sessions
 from assistant.client import Satellite
@@ -215,7 +216,7 @@ class StreamingTests(unittest.TestCase):
         self.stt.transcribe.return_value.text = "Расскажи сказку"
         satellite = Satellite(self.cfg, self.url, microphone=None)
         satellite.cfg = NS(name=self.cfg.name, server=NS(token="test-token", timeout_s=3))
-        def play(samples, rate):
+        def play(samples, rate, **kwargs):
             if satellite.play.call_count == 1:
                 self.assertFalse(self.closed.is_set())
             self.release.set()
@@ -244,7 +245,7 @@ class StreamingTests(unittest.TestCase):
         stopped = threading.Event()
         playing = threading.Event()
         playback_ended = threading.Event()
-        satellite.play = Mock(side_effect=lambda *args: (playing.set(), playback_ended.wait(2)))
+        satellite.play = Mock(side_effect=lambda *args, **kwargs: (playing.set(), playback_ended.wait(2)))
         satellite.stop_playback = Mock(side_effect=playback_ended.set)
         result = []
         worker = threading.Thread(target=lambda: result.append(satellite._stream_with_filler(b"voice", stopped)))
@@ -263,3 +264,33 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(len(requests.early), 128)
         self.assertTrue(requests.start("s", "199").is_set())
         self.assertFalse(requests.start("other", "199").is_set())
+
+    def test_voice_stop_cancels_http_and_receives_speaker_text(self):
+        self.block = True
+        self.stt.transcribe.return_value.text = "Расскажи сказку"
+        cfg = replace(self.cfg, server=replace(self.cfg.server, token="test-token", timeout_s=3))
+        satellite = Satellite(cfg, self.url, microphone=NS())
+        controller = NS(model=object(), failed=threading.Event(), close=Mock(), stop_audio=Mock())
+        controller.start = Mock(side_effect=lambda event: setattr(controller, "cancelled", event))
+        controller.play = Mock(side_effect=lambda *args: controller.cancelled.set())
+        with patch("assistant.voice_stop.make_voice_stop", return_value=controller):
+            self.assertEqual(satellite._stream_with_filler(b"voice"), {"cancelled": True})
+        self.assertTrue(self.closed.wait(1))
+        self.assertEqual(controller.play.call_args.args[2], "Первая фраза.")
+        controller.stop_audio.assert_called_once()
+        controller.close.assert_called_once()
+        self.assertIs(satellite._stop_model, controller.model)
+        self.assertIsNone(satellite._voice_stop)
+
+    def test_missing_aec_keeps_manual_cancel_without_raw_asr(self):
+        self.block = True
+        self.stt.transcribe.return_value.text = "Расскажи сказку"
+        cfg = replace(self.cfg, server=replace(self.cfg.server, token="test-token", timeout_s=3))
+        satellite = Satellite(cfg, self.url, microphone=NS())
+        satellite.play = Mock(side_effect=KeyboardInterrupt)
+        satellite.stop_playback = Mock()
+        with patch("assistant.voice_stop.make_voice_stop", side_effect=ImportError("no AEC")):
+            with self.assertLogs("assistant.client", level="WARNING"):
+                self.assertEqual(satellite._stream_with_filler(b"voice"), {"cancelled": True})
+        self.assertIsNone(satellite._voice_stop)
+        self.assertTrue(self.closed.wait(1))

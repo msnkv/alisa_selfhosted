@@ -268,6 +268,14 @@ mic:
   # null - плавающий, так и надо в обычном случае.
   energy_threshold: null
 
+voice_stop:
+  # Спутник слушает отдельное «стоп» во время ответа с WebRTC AEC.
+  # При отказе AEC голосовая отмена отключается, Ctrl+C остаётся.
+  enabled: true
+  min_confidence: 0.9
+  # 0 — автоматическая оценка задержки эха; менять после проверки в комнате.
+  echo_delay_ms: 0
+
 wake:
   enabled: true
   # Готовые модели openWakeWord англоязычные: hey_jarvis, alexa,

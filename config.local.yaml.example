@@ -18,6 +18,12 @@
 #   # Без него каждый запуск спутника начинает отдельную сессию.
 #   # session_id: "satellite:kitchen"
 
+# voice_stop:
+#   enabled: true
+#   # Если нужно временно оставить только ручную отмену: enabled: false
+#   min_confidence: 0.9
+#   echo_delay_ms: 0
+
 # mic:
 #   # На спутнике torch не ставим, конец фразы ловим по громкости.
 #   vad: "energy"

@@ -2,7 +2,8 @@
 
 Это вторая половина разделения. Клиент умеет ровно три вещи: услышать
 кодовую фразу, записать фразу до конца, проиграть то, что прислал
-сервер. Распознавания, модели и синтеза тут нет вообще — они на ПК.
+сервер. Полное распознавание вопроса, модель ответов и синтез — на ПК.
+Локально Vosk слушает кодовую фразу и команду «стоп» с эхоподавлением.
 
 Почему кодовая фраза считается на клиенте, а не на сервере: иначе
 спутник круглосуточно льёт звук из комнаты по сети. Это и расточительно,
@@ -71,6 +72,8 @@ class Satellite:
         self.session_id = cfg.server.session_id or "satellite:" + uuid.uuid4().hex
         self._sound_lock = threading.Lock()
         self._response_cancel = None
+        self._voice_stop = None
+        self._stop_model = None
         self.microphone = microphone
         self.wake = wake
         # Служебные фразы в голосе ассистента: отзыв на кодовую фразу и
@@ -143,14 +146,17 @@ class Satellite:
         text, samples, rate = choice
         print(f"  ({text})")
         try:
-            self.play(samples, rate)
+            self.play(samples, rate, text=text)
         except Exception as exc:  # noqa: BLE001
             log.warning("фраза не прозвучала: %s", exc)
         return True
 
     # --- звук -------------------------------------------------------------
 
-    def play(self, samples: np.ndarray, rate: int) -> None:
+    def play(self, samples: np.ndarray, rate: int, *, text: str = "") -> None:
+        if self._voice_stop is not None:
+            self._voice_stop.play(samples, rate, text)
+            return
         import sounddevice as sd
 
         with self._sound_lock:
@@ -160,10 +166,32 @@ class Satellite:
         sd.wait()
 
     def stop_playback(self) -> None:
+        if self._voice_stop is not None:
+            self._voice_stop.stop_audio()
+            return
         import sounddevice as sd
 
         with self._sound_lock:
             sd.stop()
+
+    def _start_voice_stop(self, stopped):
+        if self.microphone is None or not self.cfg.voice_stop.enabled:
+            return
+        controller = None
+        try:
+            from .voice_stop import make_voice_stop
+
+            controller = make_voice_stop(self.cfg, self.wake, self._stop_model)
+            self._stop_model = controller.model
+            controller.start(stopped)
+            self._voice_stop = controller
+            print("  Скажи «стоп», чтобы прервать ответ (эхоподавление включено).")
+        except Exception as exc:
+            if controller is not None:
+                controller.close()
+            log.warning("голосовой стоп недоступен: %s: %s", type(exc).__name__, exc)
+            print("  Голосовой «стоп» недоступен. Обнови requirements-client.txt, "
+                  "проверь модель Vosk и аудиоустройства. Остановка: Ctrl+C.")
 
     def _stream_with_filler(self, body: bytes, cancel_event=None) -> dict:
         """Два WAV в очереди: принимаем следующую фразу, пока звучит текущая.
@@ -176,6 +204,7 @@ class Satellite:
 
         stopped = cancel_event if cancel_event is not None else threading.Event()
         self._response_cancel = stopped
+        self._start_voice_stop(stopped)
         events = queue.Queue(maxsize=2)
         request_id = uuid.uuid4().hex
 
@@ -249,7 +278,7 @@ class Satellite:
                         if not sounded:
                             print(f"  [первый звук через {time.perf_counter() - started:.2f} с]")
                         sounded = True
-                        self.play(samples, rate)
+                        self.play(samples, rate, text=event["text"])
                 elif kind == "done":
                     completed = True
                     return event
@@ -263,6 +292,11 @@ class Satellite:
             # Даже при сетевой ошибке останавливаем серверную генерацию.
             stopped.set()
             stopper.join()
+            if self._voice_stop is not None:
+                self._voice_stop.close()
+                if self._voice_stop.failed.is_set():
+                    print("  Голосовой «стоп» был отключён: " + self._voice_stop.error)
+                self._voice_stop = None
             self._response_cancel = None
             try:
                 if not completed:
