@@ -93,6 +93,7 @@ class WakeConfig:
 @dataclass(frozen=True)
 class MicConfig:
     input_device: int | str | None
+    vad: str
     speech_threshold: float
     silence_s: float
     min_speech_s: float
@@ -210,6 +211,7 @@ def load_config(path: Path | None = None) -> Config:
         ),
         mic=MicConfig(
             input_device=mic.get("input_device"),
+            vad=str(mic.get("vad", "auto")),
             speech_threshold=float(mic.get("speech_threshold", 0.5)),
             silence_s=float(mic.get("silence_s", 0.8)),
             min_speech_s=float(mic.get("min_speech_s", 0.3)),

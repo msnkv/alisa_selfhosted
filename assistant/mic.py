@@ -79,10 +79,22 @@ class EnergyVad:
         return 1.0 if level > self.threshold else 0.0
 
 
-def make_vad(models_dir: Path | None = None):
+def make_vad(models_dir: Path | None = None, engine: str = "auto"):
+    """Чем определять конец фразы.
+
+    `silero` точнее, но тянет torch — полтора гигабайта ради одной
+    маленькой модели. На спутнике это лишнее, поэтому там ставят
+    `energy`: по громкости, без единой тяжёлой зависимости.
+
+    `auto` пробует silero и молча откатывается, если torch нет.
+    """
+    if engine == "energy":
+        return EnergyVad()
     try:
         return SileroVad(models_dir)
     except Exception as exc:  # noqa: BLE001
+        if engine == "silero":
+            raise
         log.warning(
             "silero-vad не загрузился (%s: %s), определяю конец фразы по громкости",
             type(exc).__name__, exc,
@@ -101,6 +113,7 @@ class Microphone:
         max_phrase_s: float = 15.0,
         wait_speech_s: float = 6.0,
         models_dir: Path | None = None,
+        vad_engine: str = "auto",
     ) -> None:
         self.device = device
         self.speech_threshold = speech_threshold
@@ -109,12 +122,13 @@ class Microphone:
         self.max_phrase_s = max_phrase_s
         self.wait_speech_s = wait_speech_s
         self.models_dir = models_dir
+        self.vad_engine = vad_engine
         self._vad = None
 
     @property
     def vad(self):
         if self._vad is None:
-            self._vad = make_vad(self.models_dir)
+            self._vad = make_vad(self.models_dir, self.vad_engine)
             log.info("определение конца фразы: %s", self._vad.name)
         return self._vad
 
@@ -229,4 +243,5 @@ def make_microphone(cfg) -> Microphone:
         max_phrase_s=cfg.mic.max_phrase_s,
         wait_speech_s=cfg.mic.wait_speech_s,
         models_dir=cfg.models_dir,
+        vad_engine=cfg.mic.vad,
     )

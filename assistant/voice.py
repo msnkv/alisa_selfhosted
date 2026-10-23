@@ -15,8 +15,12 @@ import logging
 import time
 from dataclasses import dataclass
 
+from typing import TYPE_CHECKING
+
 from .config import Config
-from .llm import Assistant
+
+if TYPE_CHECKING:  # только для подсказок типов
+    from .llm import Assistant
 from .prompt import FORGOTTEN_REPLY, is_forget
 from .tts import SpeechQueue
 

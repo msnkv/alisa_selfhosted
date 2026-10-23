@@ -15,9 +15,12 @@ import argparse
 import sys
 import time
 from dataclasses import replace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # только для подсказок типов
+    from .llm import Answer, Assistant
 
 from .config import ROOT, load_config, setup_logging
-from .llm import Answer, Assistant
 from .mic import make_microphone
 from .history import describe as describe_dialogue
 from .prompt import build_system_prompt, human_now, is_forget
@@ -407,6 +410,9 @@ def main() -> int:
         return 0
 
     if args.client is not None:
+        # Спутнику мозги не нужны: он пишет звук, отправляет и играет
+        # ответ. Поэтому и openai на нём ставить незачем — импорт llm
+        # ниже ленивый именно ради этого. См. requirements-client.txt.
         # Спутнику не нужны ни ключ, ни модели: он только пишет звук,
         # отправляет его и играет ответ.
         from .client import Satellite
@@ -419,6 +425,9 @@ def main() -> int:
             wake=wake,
         )
         return satellite.run() if wake is None else satellite.run_wake()
+
+    # Дальше нужен мозг, а с ним и openai.
+    from .llm import Assistant
 
     assistant = Assistant(cfg)
 
