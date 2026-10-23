@@ -78,10 +78,12 @@ class Brain:
         self.stt = stt
         self.tts = tts
         self._lock = threading.Lock()
-        # Фраза-заглушка готовится здесь, а играет её спутник. Синтеза у
-        # него нет и быть не должно, но и молчать пятнадцать секунд,
-        # пока идёт поиск, нельзя: человек не понимает, живо ли оно.
+        # Короткие служебные фразы готовятся здесь, а играет их спутник.
+        # Синтеза у него нет и быть не должно, но молчать он тоже не
+        # может: без отзыва непонятно, услышал ли он кодовую фразу, а
+        # без заглушки пятнадцать секунд поиска выглядят как поломка.
         self.filler: bytes | None = None
+        self.ack: bytes | None = None
 
     def warm_up(self) -> None:
         print("Готовлю модели...")
@@ -90,13 +92,14 @@ class Brain:
             self.stt.warm_up()
             print(f"  распознавание: {time.perf_counter() - started:.1f} с")
         if self.tts is not None:
-            from .voice import FILLER_PHRASE
+            from .voice import ACK_PHRASE, FILLER_PHRASE
 
             started = time.perf_counter()
             self.tts.warm_up()
-            samples = self.tts.synthesize(FILLER_PHRASE)
-            if len(samples):
-                self.filler = encode_wav(samples, self.tts.sample_rate)
+            for phrase, field in ((FILLER_PHRASE, "filler"), (ACK_PHRASE, "ack")):
+                samples = self.tts.synthesize(phrase)
+                if len(samples):
+                    setattr(self, field, encode_wav(samples, self.tts.sample_rate))
             print(f"  синтез речи: {time.perf_counter() - started:.1f} с")
 
     def answer_audio(self, body: bytes, suffix: str) -> dict:
@@ -405,13 +408,14 @@ def make_handler(brain: Brain, token: str):
             if parts.path == "/health":
                 self._send(200, b"ok\n", "text/plain; charset=utf-8")
                 return
-            if parts.path == "/filler.wav":
-                # Спутник забирает её один раз при запуске и держит в
-                # памяти: играть её надо мгновенно, а не качать каждый раз.
-                if brain.filler is None:
-                    self._send(404, b"no filler\n", "text/plain; charset=utf-8")
+            if parts.path in ("/filler.wav", "/ack.wav"):
+                # Спутник забирает их один раз при запуске и держит в
+                # памяти: играть надо мгновенно, а не качать каждый раз.
+                blob = brain.filler if parts.path == "/filler.wav" else brain.ack
+                if blob is None:
+                    self._send(404, b"no audio\n", "text/plain; charset=utf-8")
                     return
-                self._send(200, brain.filler, "audio/wav")
+                self._send(200, blob, "audio/wav")
                 return
             if parts.path in ("/", "/index.html"):
                 if not self._allowed(query):

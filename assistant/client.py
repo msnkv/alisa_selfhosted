@@ -74,10 +74,14 @@ class Satellite:
         self.url = url.rstrip("/")
         self.microphone = microphone
         self.wake = wake
-        # Фраза-заглушка в голосе ассистента. Синтеза здесь нет, поэтому
-        # её готовит сервер, а спутник забирает один раз при запуске.
+        # Служебные фразы в голосе ассистента: заглушка «секунду,
+        # смотрю» и отзыв «да?». Синтеза здесь нет, поэтому их готовит
+        # сервер, а спутник забирает один раз при запуске и держит в
+        # памяти — играть их надо мгновенно.
         self.filler = None
         self.filler_rate = 0
+        self.ack = None
+        self.ack_rate = 0
 
     # --- обмен с сервером -------------------------------------------------
 
@@ -102,17 +106,23 @@ class Satellite:
             print("Запусти его на ПК: alisa.bat --serve (или .\\alisa.ps1 --serve)")
             return False
         print(f"Сервер {self.url} на связи.")
-        self.load_filler()
+        self.load_phrases()
         return True
 
-    def load_filler(self) -> None:
-        """Забирает у сервера фразу «секунду, смотрю»."""
-        try:
-            with urllib.request.urlopen(self.url + "/filler.wav", timeout=10) as answer:
-                self.filler, self.filler_rate = decode_wav(answer.read())
-        except Exception as exc:  # noqa: BLE001
-            log.warning("заглушку забрать не удалось: %s", exc)
-            print("  (заглушки не будет: сервер её не отдал)")
+    def load_phrases(self) -> None:
+        """Забирает у сервера заглушку и отзыв."""
+        for path, field, name in (
+            ("/filler.wav", "filler", "заглушки"),
+            ("/ack.wav", "ack", "отзыва"),
+        ):
+            try:
+                with urllib.request.urlopen(self.url + path, timeout=10) as answer:
+                    samples, rate = decode_wav(answer.read())
+                setattr(self, field, samples)
+                setattr(self, field + "_rate", rate)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s забрать не удалось: %s", name, exc)
+                print(f"  ({name} не будет: сервер её не отдал)")
 
     # --- звук -------------------------------------------------------------
 
@@ -269,7 +279,15 @@ class Satellite:
                 return 0
             if not heard:
                 continue
+            # Отзыв вслух, а не только в консоль. Без него из другого
+            # конца комнаты непонятно, услышал он кодовую фразу или нет,
+            # и человек повторяет её впустую.
             print("  да?")
+            if self.ack is not None:
+                try:
+                    self.play(self.ack, self.ack_rate)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("отзыв не прозвучал: %s", exc)
 
             wait = None
             while True:
