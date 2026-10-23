@@ -13,10 +13,9 @@ DeepSeek и веб-поиск. Подробнее про это в JOURNAL.md, �
 
 Почему обычный HTTP из стандартной библиотеки, а не WebSocket:
 один вопрос — это один запрос и один ответ, то есть ровно то, что
-обычный запрос и делает. Ни одной новой зависимости, отлаживается
-через curl, и браузер умеет это из коробки. Потоковую передачу звука
-по сети добавим, если задержка станет мешать: сейчас время уходит в
-поиск, а не в передачу.
+обычный запрос и делает. /ask сохраняет цельный JSON для Telegram и
+старых клиентов, /ask-stream передаёт фразы как NDJSON браузеру и
+спутнику. /cancel останавливает конкретный запрос в выбранной сессии.
 
 Запуск: `.\\alisa.ps1 --serve`
 """
@@ -28,6 +27,7 @@ import io
 import json
 import logging
 import re
+import select
 import tempfile
 import threading
 import time
@@ -41,6 +41,8 @@ from urllib.parse import parse_qs, urlsplit
 import numpy as np
 
 from .prompt import FORGOTTEN_REPLY, is_forget
+from .streaming import AnswerCancelled, Requests, check_cancelled
+from .tts import split_for_synthesis
 
 if TYPE_CHECKING:
     from .llm import Assistant
@@ -90,6 +92,7 @@ class Brain:
         self.stt = stt
         self.tts = tts
         self._lock = threading.Lock()
+        self.requests = Requests()
         self._sessions: OrderedDict[str, tuple[Assistant, float]] = OrderedDict()
         # Короткие служебные фразы готовятся здесь, а играет их спутник.
         # Синтеза у него нет и быть не должно, но молчать он тоже не
@@ -155,6 +158,18 @@ class Brain:
         if self.stt is None:
             raise ValueError("распознавание выключено в config.yaml")
 
+        transcript = self.transcribe(body, suffix)
+        if not transcript:
+            return {"heard": "", "text": "Не разобрала, повтори пожалуйста."}
+        return self.answer_text(transcript, heard=transcript, session_id=session_id)
+
+    def _acquire(self, cancelled=None):
+        while not self._lock.acquire(timeout=0.1):
+            check_cancelled(cancelled)
+
+    def transcribe(self, body: bytes, suffix: str, *, cancelled=None) -> str:
+        if self.stt is None:
+            raise ValueError("распознавание выключено в config.yaml")
         # Пишем во временный файл и отдаём путь: faster-whisper сам
         # расшифрует формат через av, поэтому с телефона можно присылать
         # что угодно, а не только WAV.
@@ -162,14 +177,90 @@ class Brain:
             handle.write(body)
             path = Path(handle.name)
         try:
-            with self._lock:
+            self._acquire(cancelled)
+            try:
+                check_cancelled(cancelled)
                 transcript = self.stt.transcribe(path)
+            finally:
+                self._lock.release()
         finally:
             path.unlink(missing_ok=True)
 
-        if not transcript.text:
-            return {"heard": "", "text": "Не разобрала, повтори пожалуйста."}
-        return self.answer_text(transcript.text, heard=transcript.text, session_id=session_id)
+        return transcript.text
+
+    def stream_answer(self, question, *, body, suffix, session_id, cancelled, emit):
+        """NDJSON: отдельный WAV на фразу, без сборки всего звука в памяти.
+
+        Обычный ответ разрешаем после финального шага; у сказки инструментов
+        нет, поэтому можно передавать фразы ещё во время генерации.
+        """
+        check_cancelled(cancelled)
+        if question is None:
+            question = self.transcribe(body, suffix, cancelled=cancelled)
+        check_cancelled(cancelled)
+        emit({"type": "heard", "text": question})
+        # Ожидание занятой модели тоже можно отменить.
+        self._acquire(cancelled)
+        try:
+            check_cancelled(cancelled)
+            assistant = self._session(session_id)
+            old_mode = assistant.long_form
+            pending = []
+            committed = False
+            spoken_count = 0
+
+            def say(text):
+                nonlocal spoken_count
+                for part in split_for_synthesis(text):
+                    check_cancelled(cancelled)
+                    event = {"type": "sentence", "text": part}
+                    if self.tts is not None:
+                        samples = self.tts.synthesize(part)
+                        if len(samples):
+                            event["audio"] = base64.b64encode(encode_wav(samples, self.tts.sample_rate)).decode("ascii")
+                    check_cancelled(cancelled)
+                    emit(event)
+                    spoken_count += 1
+
+            def sentence(text):
+                check_cancelled(cancelled)
+                if committed:
+                    say(text)
+                else:
+                    pending.append(text)
+
+            def step(used_tools):
+                nonlocal committed
+                if used_tools:
+                    pending.clear()
+                else:
+                    committed = True
+                    for text in pending:
+                        say(text)
+                    pending.clear()
+
+            if not question or is_forget(question):
+                if question:
+                    assistant.forget()
+                text = FORGOTTEN_REPLY if question else "Не разобрала, повтори пожалуйста."
+                say(text)
+                emit({"type": "done", "text": text, "seconds": 0, "tools": []})
+                return
+            committed = assistant.will_be_long_form(question)
+            try:
+                answer = assistant.ask(
+                    question, on_sentence=sentence, on_step=step, cancel_event=cancelled,
+                    on_tool_call=lambda name, args: emit({"type": "search"}),
+                )
+                check_cancelled(cancelled)
+                if not spoken_count:
+                    say(answer.text)
+                emit({"type": "done", "text": answer.text, "seconds": answer.seconds, "tools": answer.tools_used})
+            except AnswerCancelled:
+                assistant.long_form = old_mode
+                raise
+        finally:
+            self._lock.release()
 
     def answer_text(
         self, question: str, *, heard: str = "", session_id: str = LEGACY_SESSION,
@@ -254,6 +345,7 @@ PAGE = """<!doctype html>
 </form>
 
 <button id="talk">Говорить</button>
+<button id="stop" disabled>Стоп</button>
 <div id="diag" class="note"></div>
 
 <div id="out"></div>
@@ -295,32 +387,93 @@ function line(text, cls) {
   return node;
 }
 
-function show(data) {
-  out.textContent = "";
-  if (data.error) { out.textContent = "Ошибка: " + data.error; return; }
-  if (data.heard) out.append(line("услышала: " + data.heard, "heard"));
-  out.append(line(data.text, "p"));
-  if (data.seconds) {
-    out.append(line(
-      data.seconds + " с" +
-        (data.tools && data.tools.length ? ", искала в интернете" : ""),
-      "heard"
-    ));
-  }
-  if (data.audio) {
-    player.src = "data:audio/wav;base64," + data.audio;
-    player.play().catch(() => {});
-  }
+let active = null;
+const stopButton = document.getElementById("stop");
+
+function busy(value) {
+  stopButton.disabled = !value;
+  document.getElementById("q").disabled = value;
+  document.getElementById("talk").disabled = value;
 }
 
-async function send(options) {
-  out.textContent = "Думаю...";
+function playPart(run, audio) {
+  return new Promise((resolve, reject) => {
+    run.release = resolve;
+    player.onended = () => { run.release = null; resolve(); };
+    player.onerror = () => { run.release = null; reject(new Error("не удалось проиграть звук")); };
+    player.src = "data:audio/wav;base64," + audio;
+    player.play().catch(reject);
+  });
+}
+
+async function cancelRun(run) {
+  if (run.cancelled) return;
+  run.cancelled = true;
+  if (active === run) {
+    active = null;
+    busy(false);
+    player.pause();
+    player.removeAttribute("src");
+    player.onended = null;
+    player.onerror = null;
+  }
+  run.controller.abort();
+  if (run.release) { run.release(); run.release = null; }
   try {
-    options.headers = { ...options.headers, "X-Session-ID": sessionId };
-    const response = await fetch("/ask" + location.search, options);
-    show(await response.json());
+    await fetch("/cancel" + location.search, {
+      method: "POST", headers: {"X-Session-ID": sessionId, "X-Request-ID": run.id},
+    });
+  } catch (_) {}
+}
+
+stopButton.onclick = () => {
+  if (!active) return;
+  const run = active;
+  out.append(line("Остановлено.", "heard"));
+  cancelRun(run);
+};
+
+async function send(options) {
+  if (active) return;
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const run = {id: Array.from(bytes, b => b.toString(16).padStart(2, "0")).join(""),
+               controller: new AbortController(), release: null};
+  active = run;
+  busy(true);
+  out.textContent = "Думаю...";
+  let done = false;
+  try {
+    options.headers = {...options.headers, "X-Session-ID": sessionId, "X-Request-ID": run.id};
+    options.signal = run.controller.signal;
+    const response = await fetch("/ask-stream" + location.search, options);
+    if (!response.ok) throw new Error("сервер ответил " + response.status);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    out.textContent = "";
+    while (active === run && !done) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, {stream: true});
+      let end;
+      while ((end = buffer.indexOf("\\n")) >= 0 && active === run && !done) {
+        const event = JSON.parse(buffer.slice(0, end));
+        buffer = buffer.slice(end + 1);
+        if (event.type === "heard") out.append(line("услышала: " + event.text, "heard"));
+        if (event.type === "sentence") {
+          out.append(line(event.text, "p"));
+          if (event.audio) await playPart(run, event.audio);
+        }
+        if (event.type === "error") throw new Error(event.text);
+        if (event.type === "done") done = true;
+      }
+    }
+    if (!done && active === run) throw new Error("ответ оборвался до завершения");
   } catch (error) {
-    out.textContent = "Не достучался до сервера: " + error;
+    if (active === run) out.append(line("Ошибка: " + error.message, "heard"));
+  } finally {
+    if (!done) await cancelRun(run);
+    if (active === run) { active = null; busy(false); }
   }
 }
 
@@ -328,7 +481,7 @@ document.getElementById("ask").onsubmit = (event) => {
   event.preventDefault();
   const field = document.getElementById("q");
   const text = field.value.trim();
-  if (!text) return;
+  if (active || !text) return;
   field.value = "";
   send({
     method: "POST",
@@ -499,7 +652,7 @@ def make_handler(brain: Brain, token: str):
             parts = urlsplit(self.path)
             query = parse_qs(parts.query)
 
-            if parts.path not in ("/ask", "/forget"):
+            if parts.path not in ("/ask", "/ask-stream", "/cancel", "/forget"):
                 self._send(404, b"nope\n", "text/plain; charset=utf-8")
                 return
             if not self._allowed(query):
@@ -510,6 +663,15 @@ def make_handler(brain: Brain, token: str):
             session_id = LEGACY_SESSION if given_session is None else given_session
             if not SESSION_ID.fullmatch(session_id):
                 self._send_json(400, {"error": "неверный X-Session-ID: 1–128 символов A-Z, a-z, 0-9, _ . : -"})
+                return
+
+            request_id = self.headers.get("X-Request-ID", "")
+            if parts.path in ("/ask-stream", "/cancel") and not SESSION_ID.fullmatch(request_id):
+                self._send_json(400, {"error": "нужен корректный X-Request-ID"})
+                return
+            if parts.path == "/cancel":
+                brain.requests.cancel(session_id, request_id)
+                self._send_json(200, {"ok": True})
                 return
 
             if parts.path == "/forget":
@@ -527,6 +689,69 @@ def make_handler(brain: Brain, token: str):
 
             body = self.rfile.read(length)
             kind = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+
+            if parts.path == "/ask-stream":
+                try:
+                    question = None
+                    if kind == "application/json":
+                        question = str(json.loads(body).get("text") or "").strip()
+                        if not question:
+                            raise ValueError("нет текста вопроса")
+                    cancelled = brain.requests.start(session_id, request_id)
+                except (ValueError, AttributeError) as exc:
+                    self._send_json(400, {"error": str(exc)})
+                    return
+
+                def emit(event):
+                    check_cancelled(cancelled)
+                    try:
+                        payload = memoryview(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
+                        deadline = time.monotonic() + brain.cfg.server.timeout_s
+                        while payload:
+                            check_cancelled(cancelled)
+                            # Медленный клиент создаёт обратное давление, но
+                            # не блокирует проверку отмены в socket.sendall.
+                            if not select.select([], [self.connection], [], 0.1)[1]:
+                                if time.monotonic() >= deadline:
+                                    raise TimeoutError("клиент перестал принимать ответ")
+                                continue
+                            try:
+                                sent = self.connection.send(payload[:65536])
+                            except BlockingIOError:
+                                continue
+                            if not sent:
+                                raise ConnectionError("клиент отключился")
+                            payload = payload[sent:]
+                            deadline = time.monotonic() + brain.cfg.server.timeout_s
+                    except OSError:
+                        cancelled.set()
+                        raise AnswerCancelled from None
+
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.connection.setblocking(False)
+                    self.close_connection = True
+                    emit({"type": "start"})
+                    suffix = ".wav" if "wav" in kind else ".ogg" if "ogg" in kind else ".webm"
+                    brain.stream_answer(
+                        question, body=body, suffix=suffix, session_id=session_id,
+                        cancelled=cancelled, emit=emit,
+                    )
+                except (AnswerCancelled, OSError):
+                    log.info("ответ %s в сессии %s остановлен", request_id, session_id)
+                except Exception:
+                    log.exception("потоковый запрос упал")
+                    try:
+                        emit({"type": "error", "text": "Не удалось подготовить ответ. Попробуй ещё раз."})
+                    except AnswerCancelled:
+                        pass
+                finally:
+                    brain.requests.finish(session_id, request_id)
+                return
 
             try:
                 if kind == "application/json":

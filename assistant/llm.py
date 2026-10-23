@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -32,6 +33,7 @@ from .prompt import (
     wants_detail,
 )
 from .search import EMPTY_RESULT_MARKER, SearchTools, make_backend
+from .streaming import check_cancelled
 
 log = logging.getLogger(__name__)
 
@@ -212,6 +214,7 @@ class Assistant:
         on_tool_call: Callable[[str, dict], None] | None = None,
         on_sentence: Callable[[str], None] | None = None,
         on_step: Callable[[bool], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> Answer:
         """Задаёт вопрос модели, при необходимости гоняя её по инструментам.
 
@@ -236,6 +239,7 @@ class Assistant:
         # ответ надо больше - иначе он обрежется на середине фразы.
         # Разговор включается и выключается словами и держится между
         # репликами.
+        check_cancelled(cancel_event)
         if long_form_cancel(question):
             self.long_form = False
         elif long_form_request(question):
@@ -297,6 +301,7 @@ class Assistant:
         step = 0
 
         while True:
+            check_cancelled(cancel_event)
             step += 1
             out_of_time = time.perf_counter() >= deadline
             last_step = step > self.cfg.agent.max_steps or out_of_time
@@ -317,9 +322,9 @@ class Assistant:
                 messages.append({"role": "user", "content": LAST_STEP_NUDGE})
                 nudged = True
 
-            content, calls, usage = self._step(
-                messages, tools, on_sentence, max_tokens
-            )
+            extra = {"cancel_event": cancel_event} if cancel_event is not None else {}
+            content, calls, usage = self._step(messages, tools, on_sentence, max_tokens, **extra)
+            check_cancelled(cancel_event)
             self._add_usage(totals, usage)
             if on_step is not None:
                 on_step(bool(calls))
@@ -339,6 +344,7 @@ class Assistant:
 
             messages.append(self._assistant_turn(content, calls))
             for call in calls:
+                check_cancelled(cancel_event)
                 name, arguments = self._parse_call(call)
                 tools_used.append(name)
                 if on_tool_call is not None:
@@ -488,6 +494,7 @@ class Assistant:
         tools: list[dict] | None,
         on_sentence: Callable[[str], None] | None,
         max_tokens: int,
+        *, cancel_event: threading.Event | None = None,
     ):
         """Один обмен с моделью. Возвращает текст, вызовы и расход токенов.
 
@@ -507,17 +514,25 @@ class Assistant:
         return self._read_stream(
             self._call_api(messages, tools, stream=True, max_tokens=max_tokens),
             on_sentence,
+            cancel_event=cancel_event,
         )
 
     @staticmethod
-    def _read_stream(stream, on_sentence: Callable[[str], None]):
+    def _read_stream(stream, on_sentence: Callable[[str], None], *, cancel_event=None):
+        try:
+            return Assistant._read_stream_chunks(stream, on_sentence, cancel_event=cancel_event)
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+
+    @staticmethod
+    def _read_stream_chunks(stream, on_sentence: Callable[[str], None], *, cancel_event=None):
         """Читает поток, отдавая законченные предложения по ходу дела.
 
-        Тонкость: заранее неизвестно, чем окажется шаг — текстом или
-        вызовом инструмента. Узнаём по тому, что приходит в кусочках, и
-        поэтому озвучивать начинаем сразу, как только пошёл текст. На
-        шаге с инструментами текста обычно нет вообще, так что лишнего
-        ассистент не скажет.
+        Текст отдаём обработчику сразу, но разрешение воспроизведения
+        обычного ответа даёт on_step только после финального шага.
+        Генератор API закрывается и при завершении, и при отмене.
         """
         pieces: list[str] = []
         buffer = ""
@@ -528,6 +543,7 @@ class Assistant:
         muted = False
 
         for chunk in stream:
+            check_cancelled(cancel_event)
             if getattr(chunk, "usage", None) is not None:
                 usage = chunk.usage
             if not chunk.choices:

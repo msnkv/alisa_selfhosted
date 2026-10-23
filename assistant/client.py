@@ -69,6 +69,8 @@ class Satellite:
             url = "http://" + url
         self.url = url.rstrip("/")
         self.session_id = cfg.server.session_id or "satellite:" + uuid.uuid4().hex
+        self._sound_lock = threading.Lock()
+        self._response_cancel = None
         self.microphone = microphone
         self.wake = wake
         # Служебные фразы в голосе ассистента: отзыв на кодовую фразу и
@@ -151,75 +153,131 @@ class Satellite:
     def play(self, samples: np.ndarray, rate: int) -> None:
         import sounddevice as sd
 
-        sd.play(samples, samplerate=rate, device=self.cfg.tts.output_device)
+        with self._sound_lock:
+            if self._response_cancel is not None and self._response_cancel.is_set():
+                return
+            sd.play(samples, samplerate=rate, device=self.cfg.tts.output_device)
         sd.wait()
 
-    def _post_with_filler(self, body: bytes) -> dict:
-        """Отправляет вопрос и подаёт голос, пока сервер думает.
+    def stop_playback(self) -> None:
+        import sounddevice as sd
 
-        Без этого после «договорил» идёт полная тишина — на вопросе с
-        поиском это пятнадцать секунд, и человек не понимает, живо ли
-        оно вообще. Запрос уходит в отдельный поток, а главный ждёт его
-        и в паузах играет заглушку.
+        with self._sound_lock:
+            sd.stop()
+
+    def _stream_with_filler(self, body: bytes, cancel_event=None) -> dict:
+        """Два WAV в очереди: принимаем следующую фразу, пока звучит текущая.
+
+        Ctrl+C во время ожидания или воспроизведения отменяет только ответ.
+        cancel_event позволяет сделать ту же кнопку в другом интерфейсе.
         """
-        outcome: dict = {}
+        import base64
+        import queue
 
-        def worker() -> None:
+        stopped = cancel_event if cancel_event is not None else threading.Event()
+        self._response_cancel = stopped
+        events = queue.Queue(maxsize=2)
+        request_id = uuid.uuid4().hex
+
+        def put(item):
+            while not stopped.is_set():
+                try:
+                    events.put(item, timeout=0.1)
+                    return
+                except queue.Full:
+                    pass
+
+        def worker():
+            request = urllib.request.Request(
+                self.url + "/ask-stream", data=body,
+                headers={"Content-Type": "audio/wav", "X-Token": self.cfg.server.token,
+                         "X-Session-ID": self.session_id, "X-Request-ID": request_id},
+            )
             try:
-                outcome["data"] = self._post("/ask", body, "audio/wav")
-            except Exception as exc:  # noqa: BLE001
-                outcome["error"] = exc
+                with urllib.request.urlopen(request, timeout=self.cfg.server.timeout_s) as response:
+                    while not stopped.is_set():
+                        raw = response.readline(4 * 1024 * 1024 + 1)
+                        if not raw:
+                            break
+                        if len(raw) > 4 * 1024 * 1024:
+                            raise ValueError("слишком большой фрагмент звука")
+                        put(json.loads(raw))
+            except Exception as exc:
+                put({"exception": exc})
+            finally:
+                put({"type": "eof"})
 
-        thread = threading.Thread(target=worker, name="ask", daemon=True)
-        started = time.perf_counter()
+        thread = threading.Thread(target=worker, name="stream", daemon=True)
         thread.start()
 
-        # Расписание: сперва короткий кивок, потом «думаю», потом
-        # «ищу» - и дальше «ищу» по кругу.
-        #
-        # Почему именно так. Кивок через секунду с небольшим ничего не
-        # обещает и длится четыре десятых секунды - он успевает
-        # прозвучать даже перед быстрым ответом и не выглядит глупо.
-        # «Думаю» - на четырёх с половиной: к этому моменту ответ без
-        # поиска уже пришёл бы. Про поиск спутник ничего не знает (он
-        # видит только, что ответа нет), поэтому «смотрю» и «ищу» идут
-        # третьими, когда ждём уже больше десяти секунд.
-        #
-        # Время считается от момента отправки, а не от прошлой фразы:
-        # сама фраза занимает полсекунды, и без общего отсчёта
-        # расписание уползало бы.
-        schedule = [(NOD_AFTER_S, "nod"), (FILLER_AFTER_S, "thinking")]
-        step = 0
-        at, name = schedule[0]
-        while True:
-            thread.join(max(0.05, started + at - time.perf_counter()))
-            if not thread.is_alive():
-                break
-            self.say_phrase(name)
-            step += 1
-            if step < len(schedule):
-                at, name = schedule[step]
-            else:
-                at = time.perf_counter() - started + FILLER_GAP_S
-                name = "search"
+        def stop_when_requested():
+            stopped.wait()
+            self.stop_playback()
 
-        if "error" in outcome:
-            raise outcome["error"]
-        return outcome["data"]
-
-    def _say_server_answer(self, result: dict) -> None:
-        if result.get("heard"):
-            print(f"  ты: {result['heard']}")
-        print(f"  {self.cfg.name}: {result.get('text', '')}")
-
-        encoded = result.get("audio")
-        if not encoded:
-            print("  (сервер прислал только текст, синтез у него выключен)")
-            return
-        import base64
-
-        samples, rate = decode_wav(base64.b64decode(encoded))
-        self.play(samples, rate)
+        stopper = threading.Thread(target=stop_when_requested, name="stop-audio", daemon=True)
+        stopper.start()
+        started = time.perf_counter()
+        completed = False
+        sounded = False
+        search = False
+        at = NOD_AFTER_S
+        nod = False
+        print("  Ctrl+C — остановить текущий ответ.")
+        try:
+            while not stopped.is_set():
+                try:
+                    event = events.get(timeout=0.1)
+                except queue.Empty:
+                    if not sounded and time.perf_counter() - started >= at:
+                        self.say_phrase("nod" if not nod else "search" if search else "thinking")
+                        at = FILLER_AFTER_S if not nod else time.perf_counter() - started + FILLER_GAP_S
+                        nod = True
+                    continue
+                if "exception" in event:
+                    raise event["exception"]
+                if stopped.is_set():
+                    break
+                kind = event.get("type")
+                if kind == "search":
+                    search = True
+                elif kind == "heard":
+                    print(f"  ты: {event['text']}")
+                elif kind == "sentence":
+                    print(f"  {self.cfg.name}: {event['text']}")
+                    if event.get("audio"):
+                        samples, rate = decode_wav(base64.b64decode(event["audio"]))
+                        if not sounded:
+                            print(f"  [первый звук через {time.perf_counter() - started:.2f} с]")
+                        sounded = True
+                        self.play(samples, rate)
+                elif kind == "done":
+                    completed = True
+                    return event
+                elif kind == "error":
+                    raise RuntimeError(event["text"])
+                elif kind == "eof":
+                    raise ConnectionError("сервер оборвал ответ до завершения")
+        except KeyboardInterrupt:
+            stopped.set()
+        finally:
+            # Даже при сетевой ошибке останавливаем серверную генерацию.
+            stopped.set()
+            stopper.join()
+            self._response_cancel = None
+            try:
+                if not completed:
+                    request = urllib.request.Request(
+                        self.url + "/cancel", data=b"{}",
+                        headers={"X-Token": self.cfg.server.token, "X-Session-ID": self.session_id,
+                                 "X-Request-ID": request_id, "Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(request, timeout=3) as response:
+                        response.read()
+            except Exception as exc:
+                log.warning("не удалось подтвердить остановку ответа: %s", type(exc).__name__)
+            thread.join(timeout=0.2)
+        print("  Ответ остановлен.")
+        return {"cancelled": True}
 
     # --- один круг --------------------------------------------------------
 
@@ -243,7 +301,7 @@ class Satellite:
         body = encode_wav(audio, RECORD_RATE)
         started = time.perf_counter()
         try:
-            result = self._post_with_filler(body)
+            result = self._stream_with_filler(body)
         except urllib.error.HTTPError as exc:
             print(f"  сервер ответил {exc.code}: {exc.read().decode('utf-8', 'replace')}")
             # Вслух, а не только в консоль: человек в другой комнате
@@ -261,7 +319,8 @@ class Satellite:
             self.say_phrase("error")
             return True
 
-        self._say_server_answer(result)
+        if result.get("cancelled"):
+            return False
         line = (
             f"запись {record_s:.1f} с | сервер {round_trip:.1f} с"
             f" (из них модель {result.get('seconds', 0):.1f} с)"
