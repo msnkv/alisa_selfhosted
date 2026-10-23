@@ -3,6 +3,8 @@
 Запуск: python -m assistant.telegram_bot. Модели здесь не загружаются.
 Адрес и токен сервера берутся из config.yaml + config.local.yaml,
 TELEGRAM_BOT_TOKEN и TELEGRAM_ALLOWED_USER_ID — из .env.
+В TELEGRAM_ALLOWED_USER_ID можно несколько ID через запятую; первый — владелец,
+ему служба напоминаний шлёт все напоминания.
 """
 
 from __future__ import annotations
@@ -152,14 +154,23 @@ class AliceServer:
         return result
 
 
-def handle_message(message: dict, telegram: Telegram, alice: AliceServer, owner: int) -> None:
+def allowed_user_ids() -> list[int]:
+    """ID из TELEGRAM_ALLOWED_USER_ID через запятую, порядок сохраняется."""
+    raw = os.getenv("TELEGRAM_ALLOWED_USER_ID", "")
+    ids = [int(part) for part in raw.replace(" ", "").split(",") if part]
+    if any(user_id <= 0 for user_id in ids):
+        raise ValueError
+    return ids
+
+
+def handle_message(message: dict, telegram: Telegram, alice: AliceServer, allowed: set[int]) -> None:
     if message.get("chat", {}).get("type") != "private":
         return
     chat_id = message["chat"]["id"]
     user_id = message.get("from", {}).get("id")
     text = (message.get("text") or "").strip()
     command = text.split(maxsplit=1)[0].split("@")[0] if text else ""
-    if user_id != owner:
+    if user_id not in allowed:
         if command == "/start":
             telegram.text(chat_id, f"Твой Telegram ID: {user_id}. Доступ к Алисе пока не настроен.")
         return
@@ -212,11 +223,9 @@ def main() -> int:
         print("Добавь TELEGRAM_BOT_TOKEN в .env (токен от @BotFather).")
         return 1
     try:
-        owner = int(os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip() or "0")
-        if owner < 0:
-            raise ValueError
+        allowed = set(allowed_user_ids())
     except ValueError:
-        print("TELEGRAM_ALLOWED_USER_ID должен быть положительным числом.")
+        print("TELEGRAM_ALLOWED_USER_ID — положительные числа через запятую.")
         return 1
     telegram = Telegram(token)
     alice = AliceServer(cfg.server)
@@ -226,7 +235,7 @@ def main() -> int:
             print("У бота включён webhook. Используй отдельного бота или отключи webhook.")
             return 1
         print(f"Бот @{me['username']} запущен. Ctrl+C — остановить.")
-        if not owner:
+        if not allowed:
             print("Напиши боту /start, добавь показанный ID в TELEGRAM_ALLOWED_USER_ID в .env "
                   "и перезапусти. До этого вопросы к Алисе закрыты.")
         offset = 0
@@ -238,7 +247,7 @@ def main() -> int:
                 for update in updates:
                     try:
                         if "message" in update:
-                            handle_message(update["message"], telegram, alice, owner)
+                            handle_message(update["message"], telegram, alice, allowed)
                     except TelegramError as exc:
                         print(exc)
                     finally:

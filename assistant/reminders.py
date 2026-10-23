@@ -252,7 +252,7 @@ def make_handler(store, token):
 
 def main():
     from .config import load_config
-    from .telegram_bot import Telegram
+    from .telegram_bot import Telegram, allowed_user_ids
 
     logging.basicConfig(level=logging.INFO)
     cfg = load_config().reminders
@@ -260,7 +260,8 @@ def main():
     try:
         if not bot_token or not cfg.token:
             raise ValueError("Укажи TELEGRAM_BOT_TOKEN и REMINDERS_TOKEN в .env.")
-        store = ReminderStore(cfg.database, cfg.timezone, int(os.getenv("TELEGRAM_ALLOWED_USER_ID", "0")))
+        # Напоминания уходят только первому ID из списка — владельцу.
+        store = ReminderStore(cfg.database, cfg.timezone, (allowed_user_ids() or [0])[0])
         server = ThreadingHTTPServer((cfg.host, cfg.port), make_handler(store, cfg.token))
     except (ValueError, KeyError, OSError, sqlite3.Error) as exc:
         print(f"Служба напоминаний не запущена: {exc}")

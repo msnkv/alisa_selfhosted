@@ -112,7 +112,7 @@ class BotTests(unittest.TestCase):
         return {"chat": {"id": 123, "type": "private"}, "from": {"id": 123}, **extra}
 
     def handle(self, message):
-        handle_message(message, self.telegram, self.alice, 123)
+        handle_message(message, self.telegram, self.alice, {123})
 
     def assert_voice(self):
         method, params = self.calls[-1]
@@ -145,7 +145,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_start_without_access_only_returns_id(self):
-        handle_message(self.message(text="/start"), self.telegram, self.alice, 0)
+        handle_message(self.message(text="/start"), self.telegram, self.alice, set())
         self.assertIn("123", self.calls[0][1]["text"])
         self.assertEqual(self.questions, [])
 
