@@ -1,0 +1,5 @@
+# Постоянная служба напоминаний. SQLite, HTTP и планировщик — в Python.
+# Модели, CUDA, звук и PyAV не нужны.
+pyyaml==6.0.3
+python-dotenv==1.2.4
+tzdata==2026.5

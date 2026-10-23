@@ -112,6 +112,24 @@ class ServerConfig:
     token: str
     timeout_s: float
     url: str
+    session_id: str = ""
+
+
+@dataclass(frozen=True)
+class VoiceStopConfig:
+    enabled: bool = True
+    min_confidence: float = 0.9
+    echo_delay_ms: int = 0
+
+
+@dataclass(frozen=True)
+class RemindersConfig:
+    url: str = ""
+    token: str = ""
+    host: str = "127.0.0.1"
+    port: int = 8766
+    database: Path = ROOT / "state" / "reminders.sqlite3"
+    timezone: str = "Europe/Moscow"
 
 
 @dataclass(frozen=True)
@@ -139,6 +157,8 @@ class Config:
     log_level: str
     dialogue_log: bool
     dialogue_file: str
+    voice_stop: VoiceStopConfig = VoiceStopConfig()
+    reminders: RemindersConfig = RemindersConfig()
 
 
 def merge_settings(base: dict, extra: dict) -> dict:
@@ -191,8 +211,23 @@ def load_config(path: Path | None = None) -> Config:
     mic = raw.get("mic", {})
     wake = raw.get("wake", {})
     server = raw.get("server", {})
+    voice_stop = raw.get("voice_stop", {})
+    reminders = raw.get("reminders", {})
 
     return Config(
+        reminders=RemindersConfig(
+            url=str(reminders.get("url", "")).strip(),
+            token=os.getenv("REMINDERS_TOKEN", "").strip(),
+            host=str(reminders.get("host", "127.0.0.1")),
+            port=int(reminders.get("port", 8766)),
+            database=ROOT / reminders.get("database", "state/reminders.sqlite3"),
+            timezone=str(reminders.get("timezone", "Europe/Moscow")),
+        ),
+        voice_stop=VoiceStopConfig(
+            enabled=bool(voice_stop.get("enabled", True)),
+            min_confidence=float(voice_stop.get("min_confidence", 0.9)),
+            echo_delay_ms=int(voice_stop.get("echo_delay_ms", 0)),
+        ),
         name=raw["assistant"]["name"],
         owner=raw["assistant"]["owner"],
         city=str(raw["assistant"].get("city", "") or ""),
@@ -282,6 +317,7 @@ def load_config(path: Path | None = None) -> Config:
             follow_up_s=float(wake.get("follow_up_s", 8.0)),
         ),
         server=ServerConfig(
+            session_id=str(server.get("session_id", "") or ""),
             host=server.get("host", "0.0.0.0"),
             port=int(server.get("port", 8765)),
             # Пустой токен = спросить может любой в домашней сети.

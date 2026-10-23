@@ -140,10 +140,10 @@ class AliceServer:
         self.token = cfg.token
         self.timeout = cfg.timeout_s
 
-    def ask(self, body: bytes, kind: str) -> dict:
+    def ask(self, body: bytes, kind: str, *, session_id: str) -> dict:
         request = urllib.request.Request(
             self.url + "/ask", data=body,
-            headers={"Content-Type": kind, "X-Token": self.token},
+            headers={"Content-Type": kind, "X-Token": self.token, "X-Session-ID": session_id},
         )
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             result = json.load(response)
@@ -165,7 +165,9 @@ def handle_message(message: dict, telegram: Telegram, alice: AliceServer, owner:
         return
     if command in ("/start", "/help"):
         telegram.text(chat_id, "Пришли текст или голосовое. Верну ответ Алисы текстом и войсом. "
-                      "Чтобы сбросить разговор, напиши «забудь».")
+                      "Чтобы сбросить разговор, напиши «забудь». "
+                      "Если подключена служба напоминаний: «напомни завтра в семь утра…», "
+                      "проверь точное время и ответь «подтверждаю». Список: «мои напоминания».")
         return
     try:
         if message.get("voice"):
@@ -185,7 +187,7 @@ def handle_message(message: dict, telegram: Telegram, alice: AliceServer, owner:
         return
 
     try:
-        result = alice.ask(body, kind)
+        result = alice.ask(body, kind, session_id=f"telegram:{chat_id}")
     except (OSError, ValueError, http.client.HTTPException):
         telegram.text(chat_id, "Сервер Алисы недоступен или не смог ответить. Попробуй позже.")
         return

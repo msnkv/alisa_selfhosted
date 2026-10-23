@@ -7,10 +7,12 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -31,6 +33,8 @@ from .prompt import (
     wants_detail,
 )
 from .search import EMPTY_RESULT_MARKER, SearchTools, make_backend
+from .streaming import check_cancelled
+from .reminder_dialogue import ReminderDialogue, INTENT as REMINDER_INTENT
 
 log = logging.getLogger(__name__)
 
@@ -140,6 +144,8 @@ class Assistant:
         # «расскажи сказку» и держится, пока не скажут «хватит» или
         # «забудь». Повторять фразу перед каждой репликой было бы странно.
         self.long_form = False
+        self.session_id = "local"
+        self.reminders = ReminderDialogue(cfg.reminders)
 
         # Журнал диалогов: по строке JSON на обмен, для разбора потом.
         # Пишется здесь, а не в голосовом цикле, намеренно: через ask
@@ -190,6 +196,20 @@ class Assistant:
 
     # --- основной вход ----------------------------------------------------
 
+    def new_session(self, session_id: str) -> Assistant:
+        """Отдельный разговор с общими настройками, знаниями и инструментами.
+
+        Копируем оболочку, а изменяемые данные разговора создаём заново.
+        Whisper и Silero принадлежат серверу и здесь не загружаются.
+        """
+        session = copy.copy(self)
+        session.history = []
+        session.long_form = False
+        session.session_id = session_id
+        session.reminders = ReminderDialogue(self.cfg.reminders)
+        session.dialogue = DialogueLog(self.dialogue.path, enabled=self.dialogue.enabled)
+        return session
+
     def ask(
         self,
         question: str,
@@ -197,6 +217,7 @@ class Assistant:
         on_tool_call: Callable[[str, dict], None] | None = None,
         on_sentence: Callable[[str], None] | None = None,
         on_step: Callable[[bool], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> Answer:
         """Задаёт вопрос модели, при необходимости гоняя её по инструментам.
 
@@ -221,6 +242,34 @@ class Assistant:
         # ответ надо больше - иначе он обрежется на середине фразы.
         # Разговор включается и выключается словами и держится между
         # репликами.
+        check_cancelled(cancel_event)
+        reminder_started = time.perf_counter()
+
+        def extract_reminder(messages, schema):
+            extra = {"cancel_event": cancel_event} if cancel_event is not None else {}
+            _, calls, _ = self._step(messages, [schema], None, 600, **extra)
+            if len(calls) != 1:
+                return None
+            name, data = self._parse_call(calls[0])
+            return data if name == "propose_reminder" else None
+
+        reminder_text = self.reminders.handle(question, self.session_id, extract_reminder, cancel_event)
+        if reminder_text is not None:
+            answer = Answer(reminder_text, time.perf_counter() - reminder_started, tools_used=["reminder"])
+            try:
+                check_cancelled(cancel_event)
+                if on_sentence is not None:
+                    on_sentence(reminder_text)
+                if on_step is not None:
+                    on_step(False)
+                check_cancelled(cancel_event)
+            except BaseException:
+                # Не оставляем подтверждение, если предпросмотр не дошёл.
+                self.reminders.reset()
+                raise
+            self._remember(question, answer.text)
+            self._log_turn(question, answer, None, False, False)
+            return answer
         if long_form_cancel(question):
             self.long_form = False
         elif long_form_request(question):
@@ -282,6 +331,7 @@ class Assistant:
         step = 0
 
         while True:
+            check_cancelled(cancel_event)
             step += 1
             out_of_time = time.perf_counter() >= deadline
             last_step = step > self.cfg.agent.max_steps or out_of_time
@@ -302,9 +352,9 @@ class Assistant:
                 messages.append({"role": "user", "content": LAST_STEP_NUDGE})
                 nudged = True
 
-            content, calls, usage = self._step(
-                messages, tools, on_sentence, max_tokens
-            )
+            extra = {"cancel_event": cancel_event} if cancel_event is not None else {}
+            content, calls, usage = self._step(messages, tools, on_sentence, max_tokens, **extra)
+            check_cancelled(cancel_event)
             self._add_usage(totals, usage)
             if on_step is not None:
                 on_step(bool(calls))
@@ -324,6 +374,7 @@ class Assistant:
 
             messages.append(self._assistant_turn(content, calls))
             for call in calls:
+                check_cancelled(cancel_event)
                 name, arguments = self._parse_call(call)
                 tools_used.append(name)
                 if on_tool_call is not None:
@@ -365,6 +416,7 @@ class Assistant:
         self.dialogue.append(
             {
                 "question": question,
+                "session_id": self.session_id,
                 "answer": answer.text,
                 # Пометка «предыдущий ответ не устроил». Нужна не
                 # ассистенту, а тому, кто потом будет разбирать журнал:
@@ -405,6 +457,7 @@ class Assistant:
         self.history.clear()
         # Разговор тоже заканчивается: «забудь» — это сброс всего.
         self.long_form = False
+        self.reminders.reset()
         # И в журнале дальше идёт уже другая беседа.
         self.dialogue.new_conversation()
 
@@ -416,6 +469,8 @@ class Assistant:
         с первой фразы. Иначе сказку пришлось бы слушать после минуты
         тишины — сперва вся генерация, и только потом звук.
         """
+        if REMINDER_INTENT.search(question) or self.reminders.pending or self.reminders.context:
+            return False
         if long_form_cancel(question):
             return False
         return self.long_form or long_form_request(question)
@@ -472,6 +527,7 @@ class Assistant:
         tools: list[dict] | None,
         on_sentence: Callable[[str], None] | None,
         max_tokens: int,
+        *, cancel_event: threading.Event | None = None,
     ):
         """Один обмен с моделью. Возвращает текст, вызовы и расход токенов.
 
@@ -491,17 +547,25 @@ class Assistant:
         return self._read_stream(
             self._call_api(messages, tools, stream=True, max_tokens=max_tokens),
             on_sentence,
+            cancel_event=cancel_event,
         )
 
     @staticmethod
-    def _read_stream(stream, on_sentence: Callable[[str], None]):
+    def _read_stream(stream, on_sentence: Callable[[str], None], *, cancel_event=None):
+        try:
+            return Assistant._read_stream_chunks(stream, on_sentence, cancel_event=cancel_event)
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+
+    @staticmethod
+    def _read_stream_chunks(stream, on_sentence: Callable[[str], None], *, cancel_event=None):
         """Читает поток, отдавая законченные предложения по ходу дела.
 
-        Тонкость: заранее неизвестно, чем окажется шаг — текстом или
-        вызовом инструмента. Узнаём по тому, что приходит в кусочках, и
-        поэтому озвучивать начинаем сразу, как только пошёл текст. На
-        шаге с инструментами текста обычно нет вообще, так что лишнего
-        ассистент не скажет.
+        Текст отдаём обработчику сразу, но разрешение воспроизведения
+        обычного ответа даёт on_step только после финального шага.
+        Генератор API закрывается и при завершении, и при отмене.
         """
         pieces: list[str] = []
         buffer = ""
@@ -512,6 +576,7 @@ class Assistant:
         muted = False
 
         for chunk in stream:
+            check_cancelled(cancel_event)
             if getattr(chunk, "usage", None) is not None:
                 usage = chunk.usage
             if not chunk.choices:
