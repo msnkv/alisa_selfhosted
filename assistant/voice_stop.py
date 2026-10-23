@@ -19,6 +19,10 @@ import numpy as np
 log = logging.getLogger(__name__)
 RATE = 48000
 FRAME = 480  # 10 мс, один кадр WebRTC
+# Запас очереди кадров: три секунды. Полсекунды на старом ноуте не
+# хватило: средний кадр успевает с огромным запасом, но единичная
+# заминка потока (проверка слова, приём следующей фразы) длиннее.
+QUEUE_FRAMES = 300
 ECHO_TAIL_S = 0.5
 WARMUP_S = 0.8
 MIN_LEVEL = 0.003
@@ -80,6 +84,8 @@ class StopDetector:
         self.previous = np.zeros(62, dtype=np.float32)
         self.audio = deque(maxlen=300)  # очищенные последние три секунды, в памяти
         self.samples_seen = 0
+        self.verifies = 0
+        self.verify_worst = 0.0
 
     def reset(self):
         self.recognizer.Reset()
@@ -127,7 +133,10 @@ class StopDetector:
                 snippet = recorded[max(0, start - offset):max(0, end - offset)]
                 if len(snippet) >= 1600:
                     pcm = (np.clip(snippet, -1, 1) * 32767).astype("<i2").tobytes()
+                    began = time.perf_counter()
                     accepted = self.verify(pcm)
+                    self.verifies += 1
+                    self.verify_worst = max(self.verify_worst, time.perf_counter() - began)
         self.reset()
         return accepted
 
@@ -144,7 +153,13 @@ class VoiceStop:
         self.done = threading.Event()
         self.shutdown = threading.Event()
         self.failed = threading.Event()
-        self.frames = queue.Queue(maxsize=50)
+        self.frames = queue.Queue(maxsize=QUEUE_FRAMES)
+        # Замеры за ответ: по ним видно, хватает ли запаса очереди.
+        self.processed = 0
+        self.busy_s = 0.0
+        self.worst_s = 0.0
+        self.deepest = 0
+        self.detector = None
         self.samples = np.empty(0, dtype=np.float32)
         self.cursor = 0
         self.own_stop = False
@@ -172,6 +187,7 @@ class VoiceStop:
             processor, recognizer, make_verifier(self.model, self.settings.min_confidence),
             self.settings.min_confidence,
         )
+        self.detector = detector
 
         def listen():
             while not self.shutdown.is_set() and not cancelled.is_set():
@@ -181,8 +197,14 @@ class VoiceStop:
                     continue
                 if self.failed.is_set():
                     continue
+                self.deepest = max(self.deepest, self.frames.qsize() + 1)
+                began = time.perf_counter()
                 try:
                     detected = detector.process(near, far, blocked=blocked, playing=playing)
+                    spent = time.perf_counter() - began
+                    self.processed += 1
+                    self.busy_s += spent
+                    self.worst_s = max(self.worst_s, spent)
                     if detected and not self.failed.is_set() and not self.shutdown.is_set():
                         log.info("голосовой стоп: независимая команда после AEC")
                         cancelled.set()
@@ -266,6 +288,20 @@ class VoiceStop:
             self.stream = None
         if hasattr(self, "worker") and self.worker.is_alive():
             self.worker.join(timeout=1)
+        if self.processed:
+            log.log(logging.WARNING if self.failed.is_set() else logging.INFO, "%s", self.summary())
+
+    def summary(self):
+        """Одна строка для журнала: где тратилось время обработки."""
+        line = (
+            f"голосовой стоп: кадров {self.processed}, в среднем "
+            f"{self.busy_s / self.processed * 1000:.2f} мс, худший {self.worst_s * 1000:.0f} мс "
+            f"при бюджете {FRAME / RATE * 1000:.0f}, очередь до {self.deepest} из {QUEUE_FRAMES}"
+        )
+        if self.detector is not None and self.detector.verifies:
+            line += (f", проверок слова {self.detector.verifies}, худшая "
+                     f"{self.detector.verify_worst * 1000:.0f} мс")
+        return line
 
 
 def make_voice_stop(cfg, wake=None, model=None):

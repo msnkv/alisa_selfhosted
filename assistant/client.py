@@ -249,6 +249,7 @@ class Satellite:
         started = time.perf_counter()
         completed = False
         sounded = False
+        first_sound_s = None
         search = False
         at = NOD_AFTER_S
         nod = False
@@ -277,11 +278,13 @@ class Satellite:
                     if event.get("audio"):
                         samples, rate = decode_wav(base64.b64decode(event["audio"]))
                         if not sounded:
-                            print(f"  [первый звук через {time.perf_counter() - started:.2f} с]")
+                            first_sound_s = time.perf_counter() - started
+                            print(f"  [первый звук через {first_sound_s:.2f} с]")
                         sounded = True
                         self.play(samples, rate, text=event["text"])
                 elif kind == "done":
                     completed = True
+                    event["first_sound_s"] = first_sound_s
                     return event
                 elif kind == "error":
                     raise RuntimeError(event["text"])
@@ -297,6 +300,8 @@ class Satellite:
                 self._voice_stop.close()
                 if self._voice_stop.failed.is_set():
                     print("  Голосовой «стоп» был отключён: " + self._voice_stop.error)
+                    if self._voice_stop.processed:
+                        print("  " + self._voice_stop.summary())
                 self._voice_stop = None
             self._response_cancel = None
             try:
@@ -356,9 +361,13 @@ class Satellite:
 
         if result.get("cancelled"):
             return False
+        # Ответ играется по ходу приёма, поэтому круг включает и речь:
+        # задержку честно показывает только первый звук.
+        first_sound = result.get("first_sound_s")
         line = (
-            f"запись {record_s:.1f} с | сервер {round_trip:.1f} с"
-            f" (из них модель {result.get('seconds', 0):.1f} с)"
+            f"запись {record_s:.1f} с"
+            + (f" | первый звук {first_sound:.1f} с" if first_sound is not None else "")
+            + f" | весь ответ {round_trip:.1f} с (модель {result.get('seconds', 0):.1f} с)"
         )
         log.info("круг спутника: %s", line)
         print(f"  [{line}]")

@@ -163,6 +163,12 @@ class VoiceStopAudioTests(unittest.TestCase):
         self.assertTrue(controller.failed.is_set())
         self.assertTrue(np.any(output))
 
+    def test_queue_holds_seconds_not_half_a_second(self):
+        controller = self.controller()
+        self.assertGreaterEqual(controller.frames.maxsize * FRAME / RATE, 3)
+        controller.processed, controller.busy_s, controller.worst_s, controller.deepest = 100, 0.05, 0.02, 7
+        self.assertIn("очередь до 7 из", controller.summary())
+
     def test_audio_discontinuity_disables_voice_cancellation(self):
         controller = self.controller()
         output = np.zeros((FRAME, 1), dtype=np.float32)
