@@ -32,7 +32,7 @@ import wave
 
 import numpy as np
 
-from .phrases import FILLER_AFTER_S, FILLER_GAP_S, Pool
+from .phrases import FILLER_AFTER_S, FILLER_GAP_S, NOD_AFTER_S, Pool
 from .prompt import is_forget
 from .server import encode_wav
 
@@ -166,21 +166,37 @@ class Satellite:
                 outcome["error"] = exc
 
         thread = threading.Thread(target=worker, name="ask", daemon=True)
+        started = time.perf_counter()
         thread.start()
 
-        # Первая фраза - из набора «думаю»: спутник не знает, пойдёт ли
-        # сервер в интернет. Говорить «смотрю», когда поиска может и не
-        # быть, нельзя. Зато если ответа нет и через двенадцать секунд -
-        # поиск точно идёт, и дальше уместны «ищу» и «проверяю».
-        waited = FILLER_AFTER_S
-        name = "thinking"
+        # Расписание: сперва короткий кивок, потом «думаю», потом
+        # «ищу» - и дальше «ищу» по кругу.
+        #
+        # Почему именно так. Кивок через секунду с небольшим ничего не
+        # обещает и длится четыре десятых секунды - он успевает
+        # прозвучать даже перед быстрым ответом и не выглядит глупо.
+        # «Думаю» - на четырёх с половиной: к этому моменту ответ без
+        # поиска уже пришёл бы. Про поиск спутник ничего не знает (он
+        # видит только, что ответа нет), поэтому «смотрю» и «ищу» идут
+        # третьими, когда ждём уже больше десяти секунд.
+        #
+        # Время считается от момента отправки, а не от прошлой фразы:
+        # сама фраза занимает полсекунды, и без общего отсчёта
+        # расписание уползало бы.
+        schedule = [(NOD_AFTER_S, "nod"), (FILLER_AFTER_S, "thinking")]
+        step = 0
+        at, name = schedule[0]
         while True:
-            thread.join(waited)
+            thread.join(max(0.05, started + at - time.perf_counter()))
             if not thread.is_alive():
                 break
             self.say_phrase(name)
-            waited = FILLER_GAP_S
-            name = "search"
+            step += 1
+            if step < len(schedule):
+                at, name = schedule[step]
+            else:
+                at = time.perf_counter() - started + FILLER_GAP_S
+                name = "search"
 
         if "error" in outcome:
             raise outcome["error"]
@@ -225,14 +241,19 @@ class Satellite:
             result = self._post_with_filler(body)
         except urllib.error.HTTPError as exc:
             print(f"  сервер ответил {exc.code}: {exc.read().decode('utf-8', 'replace')}")
+            # Вслух, а не только в консоль: человек в другой комнате
+            # видит не экран, а тишину, и ждёт ответа зря.
+            self.say_phrase("error")
             return True
         except Exception as exc:  # noqa: BLE001
             print(f"  не дошло до сервера: {type(exc).__name__}: {exc}")
+            self.say_phrase("error")
             return True
         round_trip = time.perf_counter() - started
 
         if result.get("error"):
             print(f"  ошибка на сервере: {result['error']}")
+            self.say_phrase("error")
             return True
 
         self._say_server_answer(result)

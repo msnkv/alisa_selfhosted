@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -35,11 +36,89 @@ SILERO_REPO = "snakers4/silero-models"
 # раньше, чем звук кончился. Поэтому: один играет - остальные ждут.
 _SOUND_LOCK = threading.Lock()
 
+# Сколько символов Silero берёт за один вызов. Замерено на одной и той
+# же фразе, повторённой нужное число раз: 620 символов проходят, 868 уже
+# падают с «Model couldn't generate your text, probably it's too long».
+# Сама библиотека предупреждает про тысячу, но это неправда - предел
+# внутри на числе токенов, а не символов. Шестьсот с запасом.
+#
+# Поймано сказкой: модель написала четыре тысячи символов, сервер отдал
+# их в синтез одним куском и ответил пятисоткой. На ПК этого не видно,
+# там потоковая озвучка режет ответ на предложения сама.
+MAX_SYNTH_CHARS = 600
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
+
 # Голоса русской модели v5. Послушать все: .\alisa.ps1 --voices "фраза"
 SPEAKERS = ("aidar", "baya", "kseniya", "xenia", "eugene")
 
 # Фраза для образцов голосов: тут и числа словами, и вопрос в конце,
 # и шипящие — слышно, как голос справляется с тем, что ему реально дадут.
+
+def split_for_synthesis(text: str, limit: int = MAX_SYNTH_CHARS) -> list[str]:
+    """Режет текст на куски, которые Silero осилит за один вызов.
+
+    Режем по границам предложений и набиваем кусок до предела: чем
+    меньше кусков, тем меньше швов в речи. Шов слышен как лишняя пауза,
+    потому что Silero дописывает тишину в конец каждого куска.
+
+    Если одно предложение само длиннее предела (бывает: модель умеет
+    выдать period на двести слов), оно режется по запятым, а в крайнем
+    случае по словам. Пустых кусков не возвращаем.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+
+    chunks: list[str] = []
+    current = ""
+
+    def flush() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for sentence in _SENTENCE_SPLIT.split(text):
+        if not sentence.strip():
+            continue
+        # Предложение не влезает даже само по себе - дробим его.
+        if len(sentence) > limit:
+            flush()
+            chunks.extend(_split_hard(sentence, limit))
+            continue
+        if len(current) + len(sentence) + 1 > limit:
+            flush()
+        current = f"{current} {sentence}".strip()
+    flush()
+    return chunks
+
+
+def _split_hard(sentence: str, limit: int) -> list[str]:
+    """Длинное предложение: по запятым, а что не влезло - по словам."""
+    parts: list[str] = []
+    current = ""
+    for piece in re.split(r"(?<=[,;:])\s+", sentence):
+        if len(piece) > limit:
+            if current.strip():
+                parts.append(current.strip())
+                current = ""
+            words = piece.split()
+            for word in words:
+                if len(current) + len(word) + 1 > limit:
+                    parts.append(current.strip())
+                    current = ""
+                current = f"{current} {word}".strip()
+            continue
+        if len(current) + len(piece) + 1 > limit:
+            parts.append(current.strip())
+            current = ""
+        current = f"{current} {piece}".strip()
+    if current.strip():
+        parts.append(current.strip())
+    return parts
+
+
 SAMPLE_TEXT = (
     "Болгарки лежат на левом стеллаже, третий уровень. "
     "Курс доллара сейчас восемьдесят один рубль двенадцать копеек. "
@@ -118,10 +197,29 @@ class SileroTTS:
     # --- синтез -----------------------------------------------------------
 
     def synthesize(self, text: str, speaker: str | None = None) -> np.ndarray:
+        """Озвучивает текст любой длины.
+
+        Длинный режется на куски и склеивается — иначе Silero падает,
+        см. `split_for_synthesis`. Снаружи это незаметно, и так и
+        задумано: предел принадлежит Silero, значит и обходить его
+        должна обёртка Silero, а не каждый вызывающий по отдельности.
+        """
         text = text.strip()
         if not text:
             return np.zeros(0, dtype=np.float32)
 
+        parts = split_for_synthesis(text)
+        if len(parts) > 1:
+            log.info("текст длинный (%d символов), режу на %d куска", len(text), len(parts))
+            pieces = [self._synthesize_one(part, speaker) for part in parts]
+            pieces = [piece for piece in pieces if len(piece)]
+            if not pieces:
+                return np.zeros(0, dtype=np.float32)
+            return np.concatenate(pieces)
+        return self._synthesize_one(text, speaker)
+
+    def _synthesize_one(self, text: str, speaker: str | None = None) -> np.ndarray:
+        """Один вызов Silero. Текст обязан быть в пределах его лимита."""
         started = time.perf_counter()
         kwargs = {
             "text": text,
