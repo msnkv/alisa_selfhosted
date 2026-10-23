@@ -141,12 +141,47 @@ class Config:
     dialogue_file: str
 
 
+def merge_settings(base: dict, extra: dict) -> dict:
+    """Накладывает одни настройки на другие, по веткам.
+
+    Именно по веткам, а не целиком: если в местном файле написан только
+    `mic.vad`, остальное из `mic` должно остаться как было. Иначе
+    пришлось бы копировать в него весь раздел, а это ровно та ручная
+    работа, от которой мы уходим.
+    """
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            merge_settings(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
 def load_config(path: Path | None = None) -> Config:
-    """Читает config.yaml и .env. Пути в конфиге считаются от корня проекта."""
+    """Читает config.yaml и .env. Пути в конфиге считаются от корня проекта.
+
+    Рядом с `config.yaml` может лежать `config.local.yaml` — настройки
+    этой конкретной машины. Он перекрывает то, что в нём написано, и
+    не трогает остальное.
+
+    Зачем: спутник отличается от ПК двумя строчками (адрес сервера и
+    определение конца фразы по громкости), а `config.yaml` с ПК на
+    спутник копируется после каждой правки. Без местного файла эти две
+    строчки приходилось вписывать руками каждый раз — и рано или
+    поздно забыть. В git он не попадает: у каждой машины свой.
+    """
     load_dotenv(ROOT / ".env")
 
     cfg_path = path or ROOT / "config.yaml"
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+    local_path = cfg_path.with_name(cfg_path.stem + ".local" + cfg_path.suffix)
+    if local_path.is_file():
+        local = yaml.safe_load(local_path.read_text(encoding="utf-8")) or {}
+        merge_settings(raw, local)
+        # Говорим вслух, что настройки не те, что в config.yaml: иначе
+        # потом полдня непонятно, почему машина ведёт себя иначе.
+        print(f"Поверх config.yaml наложен {local_path.name}: {', '.join(local)}")
 
     llm = raw["llm"]
     search = raw.get("search", {})
