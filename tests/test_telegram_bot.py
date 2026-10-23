@@ -68,7 +68,9 @@ class BotTests(unittest.TestCase):
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 kind = self.headers["Content-Type"]
                 if self.path == "/ask":
-                    test.questions.append((body, kind, self.headers.get("X-Token")))
+                    test.questions.append((
+                        body, kind, self.headers.get("X-Token"), self.headers.get("X-Session-ID"),
+                    ))
                     self.reply(test.server_status, json.dumps(test.result).encode())
                     return
                 method = self.path.rsplit("/", 1)[-1]
@@ -123,15 +125,16 @@ class BotTests(unittest.TestCase):
 
     def test_text_roundtrip_sends_json_text_and_playable_voice(self):
         self.handle(self.message(text="Где болгарка?"))
-        body, kind, token = self.questions[0]
+        body, kind, token, session_id = self.questions[0]
         self.assertEqual(json.loads(body), {"text": "Где болгарка?"})
         self.assertEqual((kind, token), ("application/json", "alice-secret"))
+        self.assertEqual(session_id, "telegram:123")
         self.assertEqual(self.calls[0], ("sendMessage", {"chat_id": 123, "text": "Ответ Алисы."}))
         self.assert_voice()
 
     def test_voice_roundtrip_forwards_original_ogg(self):
         self.handle(self.message(voice={"file_id": "incoming-voice", "file_size": len(self.ogg)}))
-        self.assertEqual(self.questions[0], (self.ogg, "audio/ogg", "alice-secret"))
+        self.assertEqual(self.questions[0], (self.ogg, "audio/ogg", "alice-secret", "telegram:123"))
         self.assertEqual(self.calls[0], ("getFile", {"file_id": "incoming-voice"}))
         self.assert_voice()
 

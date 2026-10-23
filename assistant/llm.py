@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -140,6 +141,7 @@ class Assistant:
         # «расскажи сказку» и держится, пока не скажут «хватит» или
         # «забудь». Повторять фразу перед каждой репликой было бы странно.
         self.long_form = False
+        self.session_id = "local"
 
         # Журнал диалогов: по строке JSON на обмен, для разбора потом.
         # Пишется здесь, а не в голосовом цикле, намеренно: через ask
@@ -189,6 +191,19 @@ class Assistant:
         return {"thinking": {"type": "disabled"}}
 
     # --- основной вход ----------------------------------------------------
+
+    def new_session(self, session_id: str) -> Assistant:
+        """Отдельный разговор с общими настройками, знаниями и инструментами.
+
+        Копируем оболочку, а изменяемые данные разговора создаём заново.
+        Whisper и Silero принадлежат серверу и здесь не загружаются.
+        """
+        session = copy.copy(self)
+        session.history = []
+        session.long_form = False
+        session.session_id = session_id
+        session.dialogue = DialogueLog(self.dialogue.path, enabled=self.dialogue.enabled)
+        return session
 
     def ask(
         self,
@@ -365,6 +380,7 @@ class Assistant:
         self.dialogue.append(
             {
                 "question": question,
+                "session_id": self.session_id,
                 "answer": answer.text,
                 # Пометка «предыдущий ответ не устроил». Нужна не
                 # ассистенту, а тому, кто потом будет разбирать журнал:

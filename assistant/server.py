@@ -27,23 +27,35 @@ import base64
 import io
 import json
 import logging
+import re
 import tempfile
 import threading
 import time
 import wave
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
 from .prompt import FORGOTTEN_REPLY, is_forget
 
+if TYPE_CHECKING:
+    from .llm import Assistant
+
 log = logging.getLogger(__name__)
 
 # Больше этого от клиента не принимаем: запись фразы это десятки
 # килобайт, а не мегабайты. Заодно защита от случайного мусора.
 MAX_BODY_BYTES = 8 * 1024 * 1024
+
+# Сессия — контекст разговора, а не авторизация: X-Token проверяется отдельно.
+LEGACY_SESSION = "legacy"
+MAX_SESSIONS = 128
+SESSION_IDLE_S = 24 * 60 * 60
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 
 
 def encode_wav(samples: np.ndarray, sample_rate: int) -> bytes:
@@ -78,6 +90,7 @@ class Brain:
         self.stt = stt
         self.tts = tts
         self._lock = threading.Lock()
+        self._sessions: OrderedDict[str, tuple[Assistant, float]] = OrderedDict()
         # Короткие служебные фразы готовятся здесь, а играет их спутник.
         # Синтеза у него нет и быть не должно, но молчать он тоже не
         # может: без отзыва непонятно, услышал ли он кодовую фразу, а
@@ -119,7 +132,25 @@ class Brain:
             for name, ready in self.phrases.items()
         }
 
-    def answer_audio(self, body: bytes, suffix: str) -> dict:
+    def _session(self, session_id: str) -> Assistant:
+        """Вызывать под _lock. Ограничиваем число и срок хранения бесед."""
+        now = time.monotonic()
+        while self._sessions:
+            key, (_, used_at) = next(iter(self._sessions.items()))
+            if now - used_at < SESSION_IDLE_S:
+                break
+            self._sessions.pop(key)
+        entry = self._sessions.pop(session_id, None)
+        if entry is None:
+            if len(self._sessions) >= MAX_SESSIONS:
+                self._sessions.popitem(last=False)
+            assistant = self.assistant.new_session(session_id)
+        else:
+            assistant = entry[0]
+        self._sessions[session_id] = (assistant, now)
+        return assistant
+
+    def answer_audio(self, body: bytes, suffix: str, *, session_id: str = LEGACY_SESSION) -> dict:
         """Звук с вопросом на входе, ответ текстом и звуком на выходе."""
         if self.stt is None:
             raise ValueError("распознавание выключено в config.yaml")
@@ -138,19 +169,21 @@ class Brain:
 
         if not transcript.text:
             return {"heard": "", "text": "Не разобрала, повтори пожалуйста."}
-        return self.answer_text(transcript.text, heard=transcript.text)
+        return self.answer_text(transcript.text, heard=transcript.text, session_id=session_id)
 
-    def answer_text(self, question: str, *, heard: str = "") -> dict:
+    def answer_text(
+        self, question: str, *, heard: str = "", session_id: str = LEGACY_SESSION,
+    ) -> dict:
         # «Забудь» обрабатываем здесь, а не в модели. Спутник текста не
         # видит - он отправляет звук, - поэтому проверить команду может
         # только сервер. Без этого модель отвечала «забыла», ничего при
         # этом не забывая.
-        if is_forget(question):
-            self.forget()
-            return self._spoken(FORGOTTEN_REPLY, heard or question)
-
         with self._lock:
-            answer = self.assistant.ask(question)
+            assistant = self._session(session_id)
+            if is_forget(question):
+                assistant.forget()
+                return self._spoken(FORGOTTEN_REPLY, heard or question)
+            answer = assistant.ask(question)
             audio = None
             if self.tts is not None:
                 samples = self.tts.synthesize(answer.text)
@@ -169,11 +202,10 @@ class Brain:
         return result
 
     def _spoken(self, text: str, heard: str) -> dict:
-        """Готовый ответ своими словами, без обращения к модели."""
+        """Готовый ответ без модели. Вызывается под _lock."""
         result = {"heard": heard, "text": text, "seconds": 0.0, "tools": []}
         if self.tts is not None:
-            with self._lock:
-                samples = self.tts.synthesize(text)
+            samples = self.tts.synthesize(text)
             if len(samples):
                 result["sample_rate"] = self.tts.sample_rate
                 result["audio"] = base64.b64encode(
@@ -181,9 +213,9 @@ class Brain:
                 ).decode("ascii")
         return result
 
-    def forget(self) -> None:
+    def forget(self, session_id: str = LEGACY_SESSION) -> None:
         with self._lock:
-            self.assistant.forget()
+            self._session(session_id).forget()
 
 
 PAGE = """<!doctype html>
@@ -240,6 +272,20 @@ chrome://flags, найди «Insecure origins treated as secure», впиши т
 const out = document.getElementById("out");
 const player = document.getElementById("player");
 
+// Сохраняем ID на этом браузере; getRandomValues работает и по HTTP в LAN.
+// Если хранилище закрыто, разговор сохраняется до перезагрузки страницы.
+const sessionId = (() => {
+  const key = "alisa.session";
+  try {
+    const saved = localStorage.getItem(key);
+    if (/^browser:[a-f0-9]{32}$/.test(saved || "")) return saved;
+  } catch (_) {}
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const id = "browser:" + Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+  try { localStorage.setItem(key, id); } catch (_) {}
+  return id;
+})();
+
 function line(text, cls) {
   const node = document.createElement(cls === "p" ? "p" : "div");
   if (cls !== "p") node.className = cls;
@@ -270,6 +316,7 @@ function show(data) {
 async function send(options) {
   out.textContent = "Думаю...";
   try {
+    options.headers = { ...options.headers, "X-Session-ID": sessionId };
     const response = await fetch("/ask" + location.search, options);
     show(await response.json());
   } catch (error) {
@@ -459,8 +506,14 @@ def make_handler(brain: Brain, token: str):
                 self._send_json(403, {"error": "нужен токен"})
                 return
 
+            given_session = self.headers.get("X-Session-ID")
+            session_id = LEGACY_SESSION if given_session is None else given_session
+            if not SESSION_ID.fullmatch(session_id):
+                self._send_json(400, {"error": "неверный X-Session-ID: 1–128 символов A-Z, a-z, 0-9, _ . : -"})
+                return
+
             if parts.path == "/forget":
-                brain.forget()
+                brain.forget(session_id)
                 self._send_json(200, {"ok": True})
                 return
 
@@ -481,7 +534,7 @@ def make_handler(brain: Brain, token: str):
                     if not question:
                         self._send_json(400, {"error": "нет текста вопроса"})
                         return
-                    result = brain.answer_text(question)
+                    result = brain.answer_text(question, session_id=session_id)
                 else:
                     # Расширение нужно av, чтобы понять формат. Браузер
                     # присылает webm, наш спутник - wav.
@@ -489,7 +542,7 @@ def make_handler(brain: Brain, token: str):
                         ".wav" if "wav" in kind else
                         ".ogg" if "ogg" in kind or "opus" in kind else ".webm"
                     )
-                    result = brain.answer_audio(body, suffix)
+                    result = brain.answer_audio(body, suffix, session_id=session_id)
             except Exception as exc:  # noqa: BLE001
                 log.exception("запрос упал")
                 self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})

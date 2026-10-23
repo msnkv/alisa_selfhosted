@@ -29,6 +29,7 @@ import time
 import urllib.error
 import urllib.request
 import wave
+import uuid
 
 import numpy as np
 
@@ -67,6 +68,7 @@ class Satellite:
         if "://" not in url:
             url = "http://" + url
         self.url = url.rstrip("/")
+        self.session_id = cfg.server.session_id or "satellite:" + uuid.uuid4().hex
         self.microphone = microphone
         self.wake = wake
         # Служебные фразы в голосе ассистента: отзыв на кодовую фразу и
@@ -81,7 +83,10 @@ class Satellite:
         request = urllib.request.Request(
             self.url + path,
             data=body,
-            headers={"Content-Type": kind, "X-Token": self.cfg.server.token},
+            headers={
+                "Content-Type": kind, "X-Token": self.cfg.server.token,
+                "X-Session-ID": self.session_id,
+            },
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=self.cfg.server.timeout_s) as answer:

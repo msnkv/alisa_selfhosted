@@ -112,6 +112,7 @@ class ServerConfig:
     token: str
     timeout_s: float
     url: str
+    session_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -282,6 +283,7 @@ def load_config(path: Path | None = None) -> Config:
             follow_up_s=float(wake.get("follow_up_s", 8.0)),
         ),
         server=ServerConfig(
+            session_id=str(server.get("session_id", "") or ""),
             host=server.get("host", "0.0.0.0"),
             port=int(server.get("port", 8765)),
             # Пустой токен = спросить может любой в домашней сети.
