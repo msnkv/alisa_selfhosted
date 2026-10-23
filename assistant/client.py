@@ -190,8 +190,9 @@ class Satellite:
             if controller is not None:
                 controller.close()
             log.warning("голосовой стоп недоступен: %s: %s", type(exc).__name__, exc)
-            print("  Голосовой «стоп» недоступен. Обнови requirements-client.txt, "
-                  "проверь модель Vosk и аудиоустройства. Остановка: Ctrl+C.")
+            print(f"  Голосовой «стоп» недоступен ({type(exc).__name__}: {exc}). "
+                  "Обнови requirements-client.txt, проверь модель Vosk и "
+                  "аудиоустройства. Остановка: Ctrl+C.")
 
     def _stream_with_filler(self, body: bytes, cancel_event=None) -> dict:
         """Два WAV в очереди: принимаем следующую фразу, пока звучит текущая.
