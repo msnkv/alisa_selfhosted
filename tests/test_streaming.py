@@ -30,7 +30,7 @@ class StreamingTests(unittest.TestCase):
         self.closed = threading.Event()
         self.responses = []
 
-        def api(assistant, messages, tools, *, stream, max_tokens):
+        def api(assistant, messages, tools, *, stream, max_tokens, timeout=None):
             self.assertTrue(stream)
             def generate():
                 try:
@@ -225,6 +225,20 @@ class StreamingTests(unittest.TestCase):
         result = satellite._stream_with_filler(b"voice")
         self.assertEqual(result["type"], "done")
         self.assertEqual(satellite.play.call_count, 2)
+
+    def test_satellite_fillers_are_limited_and_wait_has_an_end(self):
+        self.block = True
+        self.stt.transcribe.return_value.text = "Где инструмент?"
+        satellite = Satellite(self.cfg, self.url, microphone=None)
+        satellite.cfg = NS(name=self.cfg.name, server=NS(token="test-token", timeout_s=3))
+        satellite.say_phrase = Mock()
+        timing = {"NOD_AFTER_S": 0.05, "FILLER_AFTER_S": 0.1, "FILLER_GAP_S": 0.1,
+                  "FILLER_LIMIT": 2, "ANSWER_WAIT_S": 1.0}
+        with patch.multiple("assistant.client", **timing):
+            with self.assertRaises(TimeoutError):
+                satellite._stream_with_filler(b"voice")
+        self.assertEqual(satellite.say_phrase.call_count, 3, "кивок и две заглушки, не больше")
+        self.assertTrue(self.closed.wait(1), "зависший ответ надо отменить на сервере")
 
     def test_satellite_ctrl_c_stops_response_but_not_client(self):
         self.block = True

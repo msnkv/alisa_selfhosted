@@ -16,7 +16,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
-from openai import APIStatusError, OpenAI
+import httpx
+from openai import APIConnectionError, APIStatusError, OpenAI
 
 from .config import Config
 from .history import DialogueLog, looks_like_complaint
@@ -118,6 +119,23 @@ GAVE_UP = (
     "Не смог найти надёжный ответ на этот вопрос, поэтому говорить ничего "
     "не буду, чтобы не ввести в заблуждение."
 )
+
+# Модель не ответила даже на последнем шаге. Это не «не нашла», а «сервис
+# молчит», и говорить надо именно это: повторить вопрос имеет смысл.
+NO_MODEL = "Не получилось дождаться ответа модели, попробуй спросить ещё раз чуть позже."
+
+# Сколько времени гарантированно получает последний, текстовый шаг, даже
+# если бюджет agent.total_timeout_s уже съеден поиском. Без запаса ответ,
+# ради которого всё искали, обрывался бы сразу.
+FINAL_STEP_S = 15.0
+
+# Что модель получает вместо результата, если до инструмента не дошли.
+# Ответ на каждый вызов обязателен, иначе API отклонит следующий запрос.
+TOOL_SKIPPED = "Время на поиск вышло, этот вызов не выполнялся. Отвечай по тому, что уже есть."
+
+
+class StepTimeout(Exception):
+    """Потоковый ответ модели не уложился в срок шага."""
 
 
 class Assistant:
@@ -328,13 +346,14 @@ class Assistant:
         tools_used: list[str] = []
         search_empty = False
         nudged = False
+        timed_out = False
         step = 0
 
         while True:
             check_cancelled(cancel_event)
             step += 1
-            out_of_time = time.perf_counter() >= deadline
-            last_step = step > self.cfg.agent.max_steps or out_of_time
+            remaining = deadline - time.perf_counter()
+            last_step = step > self.cfg.agent.max_steps or remaining <= 0 or timed_out
             # На последнем шаге инструменты не даём: модель обязана ответить
             # словами, иначе цикл не закончится никогда.
             # В разговоре инструментов не даём совсем: лазить в интернет
@@ -352,8 +371,37 @@ class Assistant:
                 messages.append({"role": "user", "content": LAST_STEP_NUDGE})
                 nudged = True
 
+            # Бюджет проверяется между шагами, а один вызов модели сам по
+            # себе может висеть llm.timeout_s, да ещё и с повтором. Поймано
+            # 23.10.2026: два шага по 33 и 52 секунды, ответ через две
+            # минуты при бюджете 35. Поэтому срок вызова режем по остатку,
+            # а последнему шагу оставляем свой запас.
+            # Повтор внутри клиента OpenAI выключен: он удваивал срок. Его
+            # роль играет следующий, последний шаг.
+            limit = min(self.cfg.llm.timeout_s, max(remaining, FINAL_STEP_S) if last_step else remaining)
             extra = {"cancel_event": cancel_event} if cancel_event is not None else {}
-            content, calls, usage = self._step(messages, tools, on_sentence, max_tokens, **extra)
+            try:
+                content, calls, usage = self._step(
+                    messages, tools, on_sentence, max_tokens, timeout=limit, **extra,
+                )
+            except (APIConnectionError, httpx.TransportError, StepTimeout) as exc:  # и таймауты
+                check_cancelled(cancel_event)
+                # Недоговорённый обрывок озвучивать нельзя.
+                if on_step is not None:
+                    on_step(True)
+                # Шаг без инструментов повторять незачем: следующий будет
+                # таким же, а начало сказки могло уже прозвучать.
+                if tools is None:
+                    log.warning("модель не ответила за %.0f с: %s", limit, type(exc).__name__)
+                    answer = self._finish(NO_MODEL, started, totals, step, tools_used, search_empty)
+                    self._log_turn(question, answer, mode, detail, long_form)
+                    return answer
+                # Шаг с инструментами не дождались — отвечаем по тому, что
+                # уже нашли, а не сдаёмся целиком.
+                log.warning("модель не ответила за %.0f с (%s), перехожу к ответу",
+                            limit, type(exc).__name__)
+                timed_out = True
+                continue
             check_cancelled(cancel_event)
             self._add_usage(totals, usage)
             if on_step is not None:
@@ -376,6 +424,12 @@ class Assistant:
             for call in calls:
                 check_cancelled(cancel_event)
                 name, arguments = self._parse_call(call)
+                if time.perf_counter() >= deadline:
+                    # Не качаем ещё одну страницу на восемь секунд, когда
+                    # время уже вышло: следующий шаг всё равно последний.
+                    log.info("бюджет исчерпан, %s не вызываю", name)
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": TOOL_SKIPPED})
+                    continue
                 tools_used.append(name)
                 if on_tool_call is not None:
                     on_tool_call(name, arguments)
@@ -499,15 +553,19 @@ class Assistant:
         *,
         stream: bool,
         max_tokens: int,
+        timeout: float | None = None,
     ):
         kwargs = self._create_kwargs(messages, tools, max_tokens)
+        client = self.client
+        if timeout is not None:
+            client = client.with_options(timeout=timeout, max_retries=0)
         if stream:
             kwargs["stream"] = True
             # Без этого в потоковом режиме расход токенов не приходит
             # вообще, и мы перестанем видеть, что кэш промпта работает.
             kwargs["stream_options"] = {"include_usage": True}
         try:
-            return self.client.chat.completions.create(**kwargs)
+            return client.chat.completions.create(**kwargs)
         except APIStatusError as exc:
             # Отключение размышлений — единственный нестандартный параметр,
             # который мы посылаем. Если сервер его не понял, пробуем без него.
@@ -518,7 +576,7 @@ class Assistant:
                 )
                 self._thinking_supported = False
                 kwargs["extra_body"] = None
-                return self.client.chat.completions.create(**kwargs)
+                return client.chat.completions.create(**kwargs)
             raise
 
     def _step(
@@ -528,6 +586,7 @@ class Assistant:
         on_sentence: Callable[[str], None] | None,
         max_tokens: int,
         *, cancel_event: threading.Event | None = None,
+        timeout: float | None = None,
     ):
         """Один обмен с моделью. Возвращает текст, вызовы и расход токенов.
 
@@ -536,7 +595,7 @@ class Assistant:
         """
         if on_sentence is None:
             response = self._call_api(
-                messages, tools, stream=False, max_tokens=max_tokens
+                messages, tools, stream=False, max_tokens=max_tokens, timeout=timeout,
             )
             message = response.choices[0].message
             return (
@@ -544,18 +603,42 @@ class Assistant:
                 list(getattr(message, "tool_calls", None) or []),
                 response.usage,
             )
+        started = time.perf_counter()
+        stream = self._call_api(messages, tools, stream=True, max_tokens=max_tokens, timeout=timeout)
         return self._read_stream(
-            self._call_api(messages, tools, stream=True, max_tokens=max_tokens),
+            stream,
             on_sentence,
             cancel_event=cancel_event,
+            timeout=None if timeout is None else timeout - (time.perf_counter() - started),
         )
 
     @staticmethod
-    def _read_stream(stream, on_sentence: Callable[[str], None], *, cancel_event=None):
+    def _read_stream(stream, on_sentence: Callable[[str], None], *, cancel_event=None, timeout=None):
+        """Читает поток не дольше timeout секунд на весь ответ.
+
+        Таймаут httpx считается между кусками, а не на весь ответ: поток,
+        который капает по слову или шлёт пустые «я жив», он не оборвёт.
+        Поэтому по сроку поток закрывает отдельный таймер.
+        """
+        close = getattr(stream, "close", None)
+        expired = threading.Event()
+        timer = None
+        if timeout is not None and close is not None:
+            def expire():
+                expired.set()
+                close()
+            timer = threading.Timer(max(timeout, 0.0), expire)
+            timer.daemon = True
+            timer.start()
         try:
             return Assistant._read_stream_chunks(stream, on_sentence, cancel_event=cancel_event)
+        except Exception:
+            if expired.is_set():
+                raise StepTimeout(f"поток не уложился в {timeout:.0f} с") from None
+            raise
         finally:
-            close = getattr(stream, "close", None)
+            if timer is not None:
+                timer.cancel()
             if close is not None:
                 close()
 

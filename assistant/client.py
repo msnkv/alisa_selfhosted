@@ -34,7 +34,7 @@ import uuid
 
 import numpy as np
 
-from .phrases import FILLER_AFTER_S, FILLER_GAP_S, NOD_AFTER_S, Pool
+from .phrases import FILLER_AFTER_S, FILLER_GAP_S, FILLER_LIMIT, NOD_AFTER_S, Pool
 from .prompt import is_forget
 from .server import encode_wav
 
@@ -44,6 +44,12 @@ EXIT_WORDS = {"выход", "exit", "quit", "q"}
 
 # Запись с микрофона у нас всегда в этой частоте, см. mic.py.
 RECORD_RATE = 16000
+
+# Сколько ждать первого звука, прежде чем сказать «не получилось». Сервер
+# в худшем случае отвечает примерно за минуту: бюджет агента 35 с,
+# запас последнего шага 15 с, плюс распознавание и синтез. Без этого
+# предела спутник ждал бы ответа сколько угодно.
+ANSWER_WAIT_S = 90.0
 
 
 def decode_wav(data: bytes) -> tuple[np.ndarray, int]:
@@ -253,15 +259,22 @@ class Satellite:
         search = False
         at = NOD_AFTER_S
         nod = False
+        fillers = 0
         print("  Ctrl+C — остановить текущий ответ.")
         try:
             while not stopped.is_set():
                 try:
                     event = events.get(timeout=0.1)
                 except queue.Empty:
-                    if not sounded and time.perf_counter() - started >= at:
+                    waited = time.perf_counter() - started
+                    if not sounded and waited >= ANSWER_WAIT_S:
+                        # Сервер сам укладывается в минуту с небольшим,
+                        # так что это уже не «долго думает», а «завис».
+                        raise TimeoutError(f"ответа нет {ANSWER_WAIT_S:.0f} с")
+                    if not sounded and waited >= at and fillers < FILLER_LIMIT:
                         self.say_phrase("nod" if not nod else "search" if search else "thinking")
-                        at = FILLER_AFTER_S if not nod else time.perf_counter() - started + FILLER_GAP_S
+                        fillers += nod
+                        at = FILLER_AFTER_S if not nod else waited + FILLER_GAP_S
                         nod = True
                     continue
                 if "exception" in event:

@@ -43,7 +43,7 @@ class SessionTests(unittest.TestCase):
         # журнал, подменяя только ответ API, а не логику работы с памятью.
         self.prompts = []
 
-        def step(assistant, messages, tools, on_sentence, max_tokens):
+        def step(assistant, messages, tools, on_sentence, max_tokens, **_):
             self.prompts.append((assistant.session_id, messages, tools))
             return "Ответ принят.", [], None
 
