@@ -34,6 +34,7 @@ import uuid
 
 import numpy as np
 
+from .mic import StopWord
 from .phrases import FILLER_AFTER_S, FILLER_GAP_S, FILLER_LIMIT, NOD_AFTER_S, Pool
 from .prompt import is_forget
 from .server import encode_wav
@@ -349,10 +350,15 @@ class Satellite:
         """
         print("  слушаю...")
         started = time.perf_counter()
-        audio = self.microphone.record_phrase(
-            on_speech_start=lambda: print("  говоришь..."),
-            wait_speech_s=wait_speech_s,
-        )
+        try:
+            audio = self.microphone.record_phrase(
+                on_speech_start=lambda: print("  говоришь..."),
+                wait_speech_s=wait_speech_s,
+            )
+        except StopWord:
+            # Без отзыва вслух: тишина и есть подтверждение.
+            print("  стоп — жду кодовую фразу")
+            return False
         record_s = time.perf_counter() - started
         if len(audio) == 0:
             print("  речи не услышал")
@@ -430,6 +436,13 @@ class Satellite:
             self.ask_once()
             print()
 
+    def _enable_stop_word(self) -> None:
+        from .voice_stop import make_phrase_stop
+
+        self.microphone.stop_word = make_phrase_stop(self.cfg, self.wake)
+        if self.microphone.stop_word is not None:
+            print("«Стоп» вместо вопроса — вернуться к ожиданию кодовой фразы.")
+
     def run_wake(self) -> int:
         if self.wake is None:
             print("Кодовая фраза выключена в config.yaml")
@@ -441,6 +454,7 @@ class Satellite:
         started = time.perf_counter()
         self.wake.warm_up()
         print(f"Кодовая фраза готова за {time.perf_counter() - started:.1f} с")
+        self._enable_stop_word()
 
         spoken = self.wake.spoken
         print(f"\nСпутник ждёт «{spoken}». Ctrl+C — закончить.\n")

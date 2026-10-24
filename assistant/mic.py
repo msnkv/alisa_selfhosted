@@ -44,6 +44,10 @@ SILENT_LEVEL = 1e-6
 SILERO_VAD_REPO = "snakers4/silero-vad"
 
 
+class StopWord(Exception):
+    """Человек сказал «стоп» вместо вопроса: запись брошена, ждём кодовую фразу."""
+
+
 def _db(level: float) -> str:
     """Уровень в децибелах: читать проще, чем 0.0043 против 0.0128."""
     if level <= 0:
@@ -227,6 +231,9 @@ class Microphone:
         self.vad_engine = vad_engine
         self.energy = energy
         self._vad = None
+        # Ловец «стоп» отдельной фразой (voice_stop.PhraseStop). Ставит
+        # цикл с Vosk-кодовой фразой: модель уже загружена ради неё.
+        self.stop_word = None
 
     @property
     def vad(self):
@@ -247,7 +254,8 @@ class Microphone:
 
         Возвращает запись целиком, включая тишину в начале: обрезать её
         незачем, у whisper для этого свой фильтр.
-        Пустой массив означает, что речи так и не услышали.
+        Пустой массив означает, что речи так и не услышали. «Стоп»
+        отдельной фразой бросает запись исключением StopWord.
         """
         import sounddevice as sd
 
@@ -258,7 +266,23 @@ class Microphone:
             self.wait_speech_s if wait_speech_s is None else wait_speech_s
         )
         self.vad.reset()
+        stop_word = self.stop_word
+        if stop_word is not None:
+            stop_word.reset()
         chunks: queue.Queue[np.ndarray] = queue.Queue()
+
+        def heard_stop(check) -> bool:
+            # Сбой распознавания не должен ронять запись вопроса:
+            # отключаем «стоп» до перезапуска и пишем дальше.
+            nonlocal stop_word
+            if stop_word is None:
+                return False
+            try:
+                return check(stop_word)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("«стоп» при записи отключён: %s: %s", type(exc).__name__, exc)
+                stop_word = self.stop_word = None
+                return False
 
         def callback(indata, _frames, _time_info, status):
             if status:
@@ -324,6 +348,8 @@ class Microphone:
                         break
 
                 frames.append(frame)
+                if heard_stop(lambda s: s.feed(frame)):
+                    raise StopWord
                 is_speech = self.vad.probability(frame) >= self.speech_threshold
 
                 if is_speech:
@@ -347,6 +373,11 @@ class Microphone:
                     return np.zeros(0, dtype=np.float32)
         finally:
             stream.close()
+
+        # Пауза конца фразы (1,3 с) обычно длиннее, чем нужно Vosk, но
+        # если запись кончилась первой — «стоп» мог остаться в хвосте.
+        if heard_stop(lambda s: s.finish()):
+            raise StopWord
 
         audio =np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32)
         log.info(

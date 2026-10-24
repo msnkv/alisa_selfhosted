@@ -391,6 +391,83 @@ class VoiceStop:
         return line
 
 
+class PhraseStop:
+    """«Стоп» отдельной фразой, пока Алиса слушает вопрос.
+
+    Динамик в это время молчит, поэтому эхоподавления нет: 16 кГц прямо
+    с микрофона, кадры те же, что идут в запись. Засчитывается только
+    фраза целиком из «стоп» («стоп», «стоп, стоп»): «как работает
+    стоп-кран» должен дойти до сервера как вопрос.
+
+    Проверка в два прохода по той же причине, что и у VoiceStop:
+    грамматика из одного слова ставит 1.00 и на «штопор». Второй проход
+    — полный словарь по всей фразе, и в нём тоже не должно быть ничего,
+    кроме уверенных «стоп».
+    """
+
+    def __init__(self, model, min_confidence=0.9):
+        from vosk import KaldiRecognizer
+
+        grammar = json.dumps(["стоп", "[unk]"], ensure_ascii=False)
+        self.recognizer = KaldiRecognizer(model, 16000, grammar)
+        self.recognizer.SetWords(True)
+        self.verifier = KaldiRecognizer(model, 16000)
+        self.verifier.SetWords(True)
+        self.min_confidence = min_confidence
+        self.pcm = bytearray()  # звук текущей фразы первого прохода
+
+    def reset(self):
+        self.recognizer.Reset()
+        self.pcm.clear()
+
+    def feed(self, frame):
+        """True — человек сказал «стоп» отдельной фразой."""
+        pcm = (np.clip(frame, -1, 1) * 32767).astype("<i2").tobytes()
+        self.pcm += pcm
+        if not self.recognizer.AcceptWaveform(pcm):
+            return False
+        return self.judge(json.loads(self.recognizer.Result()))
+
+    def finish(self):
+        """Дослушать хвост: запись могла кончиться раньше, чем Vosk счёл
+        фразу законченной."""
+        return self.judge(json.loads(self.recognizer.FinalResult()))
+
+    def judge(self, result):
+        pcm = bytes(self.pcm)
+        self.pcm.clear()
+        words = result.get("result") or []
+        if not words or any(w.get("word") != "стоп" for w in words):
+            return False
+        self.verifier.Reset()
+        self.verifier.AcceptWaveform(pcm + bytes(16000))  # полсекунды тишины для конца фразы
+        check = json.loads(self.verifier.FinalResult())
+        heard = check.get("result") or []
+        accepted = bool(heard) and all(
+            w.get("word") == "стоп" and w.get("conf", 0) >= self.min_confidence for w in heard
+        )
+        log.info("стоп при записи: %s, проверка: %s -> %s",
+                 describe(result), describe(check), "принят" if accepted else "отказ")
+        return accepted
+
+
+def make_phrase_stop(cfg, wake):
+    """PhraseStop на модели кодовой фразы или None, если её нет.
+
+    Отдельную модель ради этого не грузим: без Vosk-кодовой фразы
+    (openwakeword) запись работает как раньше, без «стоп».
+    """
+    from .wake import VoskWakeWord
+
+    if not isinstance(wake, VoskWakeWord):
+        return None
+    try:
+        return PhraseStop(wake.model, cfg.voice_stop.min_confidence)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("«стоп» при записи недоступен: %s: %s", type(exc).__name__, exc)
+        return None
+
+
 def make_voice_stop(cfg, wake=None, model=None):
     # Проверяем AEC до загрузки модели; без него сырой микрофон не слушаем.
     from pywebrtc_audio import AudioProcessor  # noqa: F401

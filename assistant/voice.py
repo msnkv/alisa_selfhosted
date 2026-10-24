@@ -21,6 +21,7 @@ from .config import Config
 
 if TYPE_CHECKING:  # только для подсказок типов
     from .llm import Assistant
+from .mic import StopWord
 from .phrases import ACK_PHRASES, FILLER_GAP_S, SEARCH_PHRASES, Pool
 from .prompt import FORGOTTEN_REPLY, is_forget
 from .tts import SpeechQueue
@@ -126,6 +127,11 @@ class VoiceLoop:
             started = time.perf_counter()
             self.wake.warm_up()
             print(f"  кодовая фраза: {time.perf_counter() - started:.1f} с")
+            from .voice_stop import make_phrase_stop
+
+            self.microphone.stop_word = make_phrase_stop(self.cfg, self.wake)
+            if self.microphone.stop_word is not None:
+                print("  «стоп» вместо вопроса — вернуться к кодовой фразе")
 
     def _prepare(self, texts: list[str]) -> Pool:
         """Синтезирует набор служебных фраз в пары «текст, звук»."""
@@ -189,10 +195,15 @@ class VoiceLoop:
 
         print("  слушаю...")
         started = time.perf_counter()
-        audio = self.microphone.record_phrase(
-            on_speech_start=lambda: print("  говоришь..."),
-            wait_speech_s=wait_speech_s,
-        )
+        try:
+            audio = self.microphone.record_phrase(
+                on_speech_start=lambda: print("  говоришь..."),
+                wait_speech_s=wait_speech_s,
+            )
+        except StopWord:
+            # Без отзыва вслух: тишина и есть подтверждение.
+            print("  стоп — жду кодовую фразу")
+            return None
         timings.record = time.perf_counter() - started
         # Момент «человек договорил»: от него и считается ожидание в тишине.
         after_record = time.perf_counter()
