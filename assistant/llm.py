@@ -16,7 +16,10 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
-import httpx
+# Не httpx, а httpx2: openai с третьей версии работает на нём, и его
+# исключения от httpx не наследуют. С обычным httpx обрыв посреди потока
+# пролетал мимо перехвата, а срок молчания не доходил до запроса.
+import httpx2
 from openai import APIConnectionError, APIStatusError, OpenAI
 
 from .config import Config
@@ -128,6 +131,28 @@ NO_MODEL = "Не получилось дождаться ответа модел
 # если бюджет agent.total_timeout_s уже съеден поиском. Без запаса ответ,
 # ради которого всё искали, обрывался бы сразу.
 FINAL_STEP_S = 15.0
+
+# Сколько молчания считать зависанием в потоковом ответе: ни байта до
+# начала ответа или между кусками. Здоровый DeepSeek начинает за секунду
+# даже с промптом на двадцать шесть тысяч токенов, а 24.10.2026 он
+# полчаса то и дело молчал по 30 с подряд, и тогда же висел поиск.
+# Только для потока: без потока ответ приходит целиком, и подробный
+# ответ законно идёт дольше.
+STALL_S = 8.0
+
+# Меньше этого на повтор зависшего шага не тратимся — не успеет.
+RETRY_MIN_S = 3.0
+
+# Последний шаг после того, как шаг с инструментами не дождались: поиска
+# не было вовсе, и LAST_STEP_NUDGE («ответь по тому, что нашла») не
+# подходит. Без указания модель отвечает про погоду из головы.
+NO_SEARCH_NUDGE = (
+    "Поиск сейчас недоступен, проверить ничего не получилось. Если вопрос "
+    "про свежие данные — погоду, курсы, цены, новости, расписания, — не "
+    "называй никаких цифр и фактов, а честно скажи одной фразой, что "
+    "сейчас проверить не получилось. На остальное отвечай как обычно. "
+    "Никакой разметки и никаких вызовов инструментов в ответе."
+)
 
 # Что модель получает вместо результата, если до инструмента не дошли.
 # Ответ на каждый вызов обязателен, иначе API отклонит следующий запрос.
@@ -370,28 +395,60 @@ class Assistant:
                 # текстом. Сообщение идёт в конец, кэш промпта не рвётся.
                 messages.append({"role": "user", "content": LAST_STEP_NUDGE})
                 nudged = True
+            elif timed_out and not nudged:
+                # До поиска не дошли: модель не ответила на шаге с
+                # инструментами. Без этого указания она на последнем шаге
+                # выдумала погоду — «около семи градусов» (24.10.2026).
+                messages.append({"role": "user", "content": NO_SEARCH_NUDGE})
+                nudged = True
 
             # Бюджет проверяется между шагами, а один вызов модели сам по
             # себе может висеть llm.timeout_s, да ещё и с повтором. Поймано
             # 23.10.2026: два шага по 33 и 52 секунды, ответ через две
             # минуты при бюджете 35. Поэтому срок вызова режем по остатку,
             # а последнему шагу оставляем свой запас.
-            # Повтор внутри клиента OpenAI выключен: он удваивал срок. Его
-            # роль играет следующий, последний шаг.
+            # Повтор внутри клиента OpenAI выключен: он удваивал срок.
+            # Повторяем сами, ниже, и только зависший шаг.
             limit = min(self.cfg.llm.timeout_s, max(remaining, FINAL_STEP_S) if last_step else remaining)
+            step_deadline = time.perf_counter() + limit
             extra = {"cancel_event": cancel_event} if cancel_event is not None else {}
-            try:
-                content, calls, usage = self._step(
-                    messages, tools, on_sentence, max_tokens, timeout=limit, **extra,
-                )
-            except (APIConnectionError, httpx.TransportError, StepTimeout) as exc:  # и таймауты
-                check_cancelled(cancel_event)
+            # Зависший запрос повторяем один раз, по новому соединению, —
+            # как попытки поиска внахлёст. Здоровый DeepSeek начинает
+            # ответ за секунду, так что молчание дольше STALL_S — это
+            # зависание, и второй запрос почти всегда проходит. Не
+            # повторяем, если что-то уже прозвучало: начало сказки дважды.
+            spoke = []
+            speak = None if on_sentence is None else (lambda s: (spoke.append(s), on_sentence(s)))
+            failure = None
+            for attempt in (1, 2):
+                try:
+                    content, calls, usage = self._step(
+                        messages, tools, speak, max_tokens,
+                        timeout=step_deadline - time.perf_counter(), **extra,
+                    )
+                    failure = None
+                    break
+                except (APIConnectionError, httpx2.TransportError, StepTimeout) as exc:  # и таймауты
+                    check_cancelled(cancel_event)
+                    failure = exc
+                    left = step_deadline - time.perf_counter()
+                    if attempt == 2 or spoke or left < RETRY_MIN_S:
+                        break
+                    log.warning("модель молчит (%s), повторяю запрос, осталось %.0f с",
+                                type(exc).__name__, left)
+                    # Обрывок первой попытки озвучивать нельзя.
+                    if on_step is not None:
+                        on_step(True)
+            if failure is not None:
+                exc = failure
                 # Недоговорённый обрывок озвучивать нельзя.
                 if on_step is not None:
                     on_step(True)
                 # Шаг без инструментов повторять незачем: следующий будет
-                # таким же, а начало сказки могло уже прозвучать.
-                if tools is None:
+                # таким же, а начало сказки могло уже прозвучать. Две
+                # попытки подряд без ответа — сервис лежит, и последний шаг
+                # тоже не ответит: честно говорим сразу, не ждём ещё.
+                if tools is None or attempt == 2:
                     log.warning("модель не ответила за %.0f с: %s", limit, type(exc).__name__)
                     answer = self._finish(NO_MODEL, started, totals, step, tools_used, search_empty)
                     self._log_turn(question, answer, mode, detail, long_form)
@@ -558,6 +615,11 @@ class Assistant:
         kwargs = self._create_kwargs(messages, tools, max_tokens)
         client = self.client
         if timeout is not None:
+            if stream:
+                # Таймаут httpx — это молчание между байтами, а не срок
+                # всего ответа: весь ответ ограничивает таймер в _read_stream.
+                stall = min(timeout, STALL_S)
+                timeout = httpx2.Timeout(timeout, connect=stall, read=stall)
             client = client.with_options(timeout=timeout, max_retries=0)
         if stream:
             kwargs["stream"] = True
