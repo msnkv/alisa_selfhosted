@@ -31,6 +31,7 @@ import select
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -265,7 +266,9 @@ class Brain:
 
     def answer_text(
         self, question: str, *, heard: str = "", session_id: str = LEGACY_SESSION,
+        speak: bool = True,
     ) -> dict:
+        """speak=False — только текст: для Home Assistant, он озвучивает сам."""
         # «Забудь» обрабатываем здесь, а не в модели. Спутник текста не
         # видит - он отправляет звук, - поэтому проверить команду может
         # только сервер. Без этого модель отвечала «забыла», ничего при
@@ -274,10 +277,10 @@ class Brain:
             assistant = self._session(session_id)
             if is_forget(question):
                 assistant.forget()
-                return self._spoken(FORGOTTEN_REPLY, heard or question)
+                return self._spoken(FORGOTTEN_REPLY, heard or question, speak=speak)
             answer = assistant.ask(question)
             audio = None
-            if self.tts is not None:
+            if self.tts is not None and speak:
                 samples = self.tts.synthesize(answer.text)
                 if len(samples):
                     audio = encode_wav(samples, self.tts.sample_rate)
@@ -293,10 +296,10 @@ class Brain:
             result["audio"] = base64.b64encode(audio).decode("ascii")
         return result
 
-    def _spoken(self, text: str, heard: str) -> dict:
+    def _spoken(self, text: str, heard: str, *, speak: bool = True) -> dict:
         """Готовый ответ без модели. Вызывается под _lock."""
         result = {"heard": heard, "text": text, "seconds": 0.0, "tools": []}
-        if self.tts is not None:
+        if self.tts is not None and speak:
             samples = self.tts.synthesize(text)
             if len(samples):
                 result["sample_rate"] = self.tts.sample_rate
@@ -586,6 +589,92 @@ document.addEventListener("visibilitychange", () => {
 """
 
 
+# --- OpenAI-совместимый вход для Home Assistant ----------------------------
+#
+# HA (этап 3) отдаёт текст вопроса «агенту разговора», а тот умеет
+# ходить на любой сервер с OpenAI-совместимым API. Так наш агент
+# подключается к HA без своей интеграции на Python: снаружи он
+# выглядит как модель «alisa», внутри — тот же Assistant.ask со всеми
+# правилами, data/ и поиском.
+#
+# Что от протокола берём, а что нет. HA присылает свою историю и свой
+# системный промпт (и, может быть, инструменты для умного дома). Их не
+# используем: правила, память диалога и инструменты у нас свои, а
+# умный дом владельцу не нужен. Берём только последнюю реплику
+# пользователя. Озвучивает ответ сам HA через Wyoming, поэтому здесь
+# только текст.
+
+OPENAI_MODEL = "alisa"
+OPENAI_SESSION = "ha"
+
+
+def openai_question(data: dict) -> str:
+    """Текст последней реплики пользователя из запроса chat/completions."""
+    for message in reversed(data.get("messages") or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            # Новый формат: список частей, текст в частях типа text.
+            content = " ".join(
+                str(part.get("text") or "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        return str(content or "").strip()
+    return ""
+
+
+def openai_session(data: dict, header: str | None) -> str:
+    """Сессия HA: заголовок, поле user или общая «ha»."""
+    for candidate in (header, data.get("user")):
+        if candidate and SESSION_ID.fullmatch(str(candidate)):
+            return str(candidate)
+    return OPENAI_SESSION
+
+
+def openai_reply(text: str, model: str) -> dict:
+    return {
+        "id": "chatcmpl-" + uuid.uuid4().hex,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        }],
+        # Токены считает DeepSeek, а не мы; нули честнее выдумки.
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+def openai_stream(text: str, model: str) -> list[bytes]:
+    """Тот же ответ кусками SSE для клиентов, которые просят stream.
+
+    Ответ к этому моменту уже готов целиком: озвучивать по фразам HA
+    будет сам, а промежуточный текст шагов с поиском отдавать нельзя —
+    его модель потом выбрасывает (см. «Озвучивается только финальный
+    шаг» в CLAUDE.md).
+    """
+    base = {
+        "id": "chatcmpl-" + uuid.uuid4().hex,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+    }
+
+    def chunk(delta: dict, finish: str | None) -> bytes:
+        body = {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        return b"data: " + json.dumps(body, ensure_ascii=False).encode("utf-8") + b"\n\n"
+
+    return [
+        chunk({"role": "assistant", "content": ""}, None),
+        chunk({"content": text}, None),
+        chunk({}, "stop"),
+        b"data: [DONE]\n\n",
+    ]
+
+
 def make_handler(brain: Brain, token: str):
     page = PAGE.replace("__NAME__", brain.cfg.name)
     # Код для спутника снимаем один раз при запуске: отдаём ровно то,
@@ -626,7 +715,44 @@ def make_handler(brain: Brain, token: str):
             if not token:
                 return True
             given = self.headers.get("X-Token") or (query.get("token") or [""])[0]
+            # Клиенты OpenAI шлют ключ так; в HA это поле «API key».
+            bearer = self.headers.get("Authorization") or ""
+            if not given and bearer.lower().startswith("bearer "):
+                given = bearer[7:].strip()
             return given == token
+
+        def _openai_chat(self, body: bytes) -> None:
+            try:
+                data = json.loads(body)
+                if not isinstance(data, dict):
+                    raise ValueError("ожидал JSON-объект")
+            except ValueError as exc:
+                self._send_json(400, {"error": {"message": f"плохой JSON: {exc}"}})
+                return
+            question = openai_question(data)
+            if not question:
+                self._send_json(400, {"error": {"message": "нет реплики пользователя"}})
+                return
+            session_id = openai_session(data, self.headers.get("X-Session-ID"))
+            model = str(data.get("model") or OPENAI_MODEL)
+            try:
+                result = brain.answer_text(question, session_id=session_id, speak=False)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("запрос из HA упал")
+                self._send_json(500, {"error": {"message": f"{type(exc).__name__}: {exc}"}})
+                return
+            log.info("HA (%s): %r -> %r", session_id, question, result["text"])
+            if not data.get("stream"):
+                self._send_json(200, openai_reply(result["text"], model))
+                return
+            parts = openai_stream(result["text"], model)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(sum(len(part) for part in parts)))
+            self.end_headers()
+            for part in parts:
+                self.wfile.write(part)
 
         # --- маршруты -----------------------------------------------------
 
@@ -651,6 +777,15 @@ def make_handler(brain: Brain, token: str):
                     self._send(404, b"no audio\n", "text/plain; charset=utf-8")
                     return
                 self._send(200, ready[0][1], "audio/wav")
+                return
+            if parts.path == "/v1/models":
+                # HA при подключении проверяет адрес списком моделей.
+                if not self._allowed(query):
+                    self._send_json(401, {"error": {"message": "нужен токен"}})
+                    return
+                self._send_json(200, {"object": "list", "data": [{
+                    "id": OPENAI_MODEL, "object": "model", "created": 0, "owned_by": "alisa",
+                }]})
                 return
             if parts.path in ("/client/manifest", "/client/file"):
                 # Обновление спутника, см. update.py. Отдаётся только то,
@@ -680,6 +815,16 @@ def make_handler(brain: Brain, token: str):
             parts = urlsplit(self.path)
             query = parse_qs(parts.query)
 
+            if parts.path == "/v1/chat/completions":
+                if not self._allowed(query):
+                    self._send_json(401, {"error": {"message": "нужен токен"}})
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 < length <= MAX_BODY_BYTES:
+                    self._send_json(400, {"error": {"message": "пустой или слишком большой запрос"}})
+                    return
+                self._openai_chat(self.rfile.read(length))
+                return
             if parts.path not in ("/ask", "/ask-stream", "/cancel", "/forget"):
                 self._send(404, b"nope\n", "text/plain; charset=utf-8")
                 return
