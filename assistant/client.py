@@ -34,6 +34,7 @@ import uuid
 
 import numpy as np
 
+from . import update
 from .mic import StopWord
 from .phrases import FILLER_AFTER_S, FILLER_GAP_S, FILLER_LIMIT, NOD_AFTER_S, Pool
 from .prompt import is_forget
@@ -51,6 +52,10 @@ RECORD_RATE = 16000
 # запас последнего шага 15 с, плюс распознавание и синтез. Без этого
 # предела спутник ждал бы ответа сколько угодно.
 ANSWER_WAIT_S = 90.0
+
+# Как часто в тишине спрашивать сервер, не обновился ли он. Ожидание
+# кодовой фразы на это время прерывается и начинается заново.
+UPDATE_CHECK_S = 120.0
 
 
 def decode_wav(data: bytes) -> tuple[np.ndarray, int]:
@@ -70,8 +75,14 @@ def decode_wav(data: bytes) -> tuple[np.ndarray, int]:
 
 
 class Satellite:
-    def __init__(self, cfg, url: str, *, microphone, wake=None) -> None:
+    def __init__(self, cfg, url: str, *, microphone, wake=None, auto_update: bool = False) -> None:
         self.cfg = cfg
+        # auto_update ставит client.bat: он умеет запустить спутник
+        # заново после обновления. Без него только предупреждаем.
+        self.auto_update = auto_update
+        self.version = update.local_version()
+        self._first_server_version = None
+        self.restart_needed = False
         # Без схемы urllib не работает, а писать её руками каждый раз лень.
         if "://" not in url:
             url = "http://" + url
@@ -104,10 +115,40 @@ class Satellite:
         with urllib.request.urlopen(request, timeout=self.cfg.server.timeout_s) as answer:
             return json.loads(answer.read().decode("utf-8"))
 
+    def note_version(self, headers) -> None:
+        """Сверяет версию кода сервера со своей, см. update.py."""
+        seen = headers.get(update.VERSION_HEADER)
+        if not seen or self.restart_needed:
+            return
+        if self._first_server_version is None:
+            self._first_server_version = seen
+            if seen != self.version:
+                # Уже при запуске не совпало — значит обновление не
+                # прошло. Перезапуск тут не поможет, а зациклится.
+                print(f"  Код спутника ({self.version}) не совпадает с сервером ({seen}): "
+                      "обновление не прошло, работаю со старым.")
+            return
+        if seen != self._first_server_version and seen != self.version:
+            self.restart_needed = True
+            log.info("сервер обновился: %s -> %s", self._first_server_version, seen)
+            if self.auto_update:
+                print("  (сервер обновился — после ответа перезапущусь с новым кодом)")
+            else:
+                print("  (сервер обновился — перезапусти спутник через client.bat)")
+
+    def poll_version(self) -> None:
+        try:
+            with urllib.request.urlopen(self.url + "/health", timeout=5) as answer:
+                answer.read()
+                self.note_version(answer.headers)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("версию сервера узнать не удалось: %s", exc)
+
     def check(self) -> bool:
         try:
             with urllib.request.urlopen(self.url + "/health", timeout=5) as answer:
                 answer.read()
+                self.note_version(answer.headers)
         except Exception as exc:  # noqa: BLE001
             print(f"Сервер {self.url} не отвечает: {type(exc).__name__}: {exc}")
             # Подсказываем оба варианта: из cmd файл .ps1 не
@@ -232,6 +273,7 @@ class Satellite:
             )
             try:
                 with urllib.request.urlopen(request, timeout=self.cfg.server.timeout_s) as response:
+                    self.note_version(response.headers)
                     while not stopped.is_set():
                         raw = response.readline(4 * 1024 * 1024 + 1)
                         if not raw:
@@ -435,6 +477,14 @@ class Satellite:
                 continue
             self.ask_once()
             print()
+            if self._should_restart():
+                return update.RESTART_CODE
+
+    def _should_restart(self) -> bool:
+        if not (self.restart_needed and self.auto_update):
+            return False
+        print("Сервер обновился, перезапускаюсь с новым кодом.\n")
+        return True
 
     def _enable_stop_word(self) -> None:
         from .voice_stop import make_phrase_stop
@@ -461,11 +511,17 @@ class Satellite:
 
         while True:
             try:
-                heard = self.wake.wait()
+                heard = self.wake.wait(timeout_s=UPDATE_CHECK_S if self.auto_update else None)
             except KeyboardInterrupt:
                 print()
                 return 0
             if not heard:
+                # Вышло время ожидания: заодно узнаём, не обновился ли
+                # сервер, пока в комнате было тихо.
+                if self.auto_update:
+                    self.poll_version()
+                    if self._should_restart():
+                        return update.RESTART_CODE
                 continue
             # Отзыв вслух, а не только в консоль. Без него из другого
             # конца комнаты непонятно, услышал он кодовую фразу или нет,
@@ -492,3 +548,5 @@ class Satellite:
             if self.cfg.wake.cooldown_s > 0:
                 time.sleep(self.cfg.wake.cooldown_s)
             print()
+            if self._should_restart():
+                return update.RESTART_CODE

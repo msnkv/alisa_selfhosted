@@ -439,6 +439,10 @@ def main() -> int:
         "--client", nargs="?", const="", metavar="АДРЕС",
         help="работать спутником: микрофон тут, мозги на сервере",
     )
+    parser.add_argument(
+        "--auto-update", action="store_true",
+        help="спутник: выйти с кодом 3, когда сервер обновился (ставит client.bat)",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -493,6 +497,7 @@ def main() -> int:
             args.client or cfg.server.url,
             microphone=make_microphone(cfg),
             wake=wake,
+            auto_update=args.auto_update,
         )
         return satellite.run() if wake is None else satellite.run_wake()
 

@@ -22,7 +22,14 @@ if not defined RUNNER for /f "delims=" %%p in ('py -3 -c "import yaml,sys;print(
 if not defined RUNNER for /f "delims=" %%p in ('python -c "import yaml,sys;print(sys.executable)" 2^>nul') do set "RUNNER=%%p"
 if not defined RUNNER goto :nopython
 
-"%RUNNER%" -m assistant.cli --client %*
+rem Перед запуском подтягиваем код с сервера (assistant\update.py).
+rem Код выхода 3 - сервер обновился посреди работы: обновиться
+rem и запуститься заново. Сам этот .bat не обновляется никогда:
+rem cmd читает его по ходу, подмена на лету ломает выполнение.
+:again
+"%RUNNER%" -m assistant.update %*
+"%RUNNER%" -m assistant.cli --client %* --auto-update
+if errorlevel 3 if not errorlevel 4 goto :again
 goto :eof
 
 :nopython

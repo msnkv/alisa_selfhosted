@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
+from . import update
 from .prompt import FORGOTTEN_REPLY, is_forget
 from .streaming import AnswerCancelled, Requests, check_cancelled
 from .tts import split_for_synthesis
@@ -587,12 +588,23 @@ document.addEventListener("visibilitychange", () => {
 
 def make_handler(brain: Brain, token: str):
     page = PAGE.replace("__NAME__", brain.cfg.name)
+    # Код для спутника снимаем один раз при запуске: отдаём ровно то,
+    # чем работает сервер, а не то, что успели поправить на диске.
+    client_files = update.collect()
+    client_sums = update.manifest(client_files)
+    client_version = update.version(client_sums)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "alisa"
         # Иначе каждый запрос печатает строку в stderr поверх всего.
         def log_message(self, fmt, *args):  # noqa: D401
             log.info("%s - %s", self.address_string(), fmt % args)
+
+        def end_headers(self) -> None:
+            # Версия кода спутника в каждом ответе: по ней спутник
+            # узнаёт, что сервер перезапустили с новым кодом.
+            self.send_header(update.VERSION_HEADER, client_version)
+            super().end_headers()
 
         # --- мелочи -------------------------------------------------------
 
@@ -639,6 +651,22 @@ def make_handler(brain: Brain, token: str):
                     self._send(404, b"no audio\n", "text/plain; charset=utf-8")
                     return
                 self._send(200, ready[0][1], "audio/wav")
+                return
+            if parts.path in ("/client/manifest", "/client/file"):
+                # Обновление спутника, см. update.py. Отдаётся только то,
+                # что попало в снимок: путь не из списка — 404, так что
+                # ни data/, ни .env отсюда не достать.
+                if not self._allowed(query):
+                    self._send(403, b"token?\n", "text/plain; charset=utf-8")
+                    return
+                if parts.path == "/client/manifest":
+                    self._send_json(200, {"version": client_version, "files": client_sums})
+                    return
+                name = (query.get("path") or [""])[0]
+                if name not in client_files:
+                    self._send(404, b"nope\n", "text/plain; charset=utf-8")
+                    return
+                self._send(200, client_files[name], "application/octet-stream")
                 return
             if parts.path in ("/", "/index.html"):
                 if not self._allowed(query):
@@ -789,6 +817,7 @@ def serve(cfg, assistant, stt, tts) -> int:
     print(f"  с этого ПК:     http://localhost:{cfg.server.port}/")
     print(f"  с телефона:     http://<адрес этого ПК>:{cfg.server.port}/")
     print("  адрес ПК покажет команда ipconfig")
+    print(f"  код для спутника: версия {update.local_version()}")
     if not cfg.server.token:
         # Говорим прямо: в data/ лежат гараж, рецепты и бюджет, и любой
         # в домашней сети может про них спросить. Это осознанный выбор,
