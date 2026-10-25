@@ -123,6 +123,14 @@ class VoiceStopConfig:
 
 
 @dataclass(frozen=True)
+class WyomingConfig:
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    stt_port: int = 10300
+    tts_port: int = 10200
+
+
+@dataclass(frozen=True)
 class RemindersConfig:
     url: str = ""
     token: str = ""
@@ -159,6 +167,7 @@ class Config:
     dialogue_file: str
     voice_stop: VoiceStopConfig = VoiceStopConfig()
     reminders: RemindersConfig = RemindersConfig()
+    wyoming: WyomingConfig = WyomingConfig()
 
 
 def merge_settings(base: dict, extra: dict) -> dict:
@@ -213,8 +222,15 @@ def load_config(path: Path | None = None) -> Config:
     server = raw.get("server", {})
     voice_stop = raw.get("voice_stop", {})
     reminders = raw.get("reminders", {})
+    wyoming = raw.get("wyoming", {}) or {}
 
     return Config(
+        wyoming=WyomingConfig(
+            enabled=bool(wyoming.get("enabled", False)),
+            host=str(wyoming.get("host", "0.0.0.0")),
+            stt_port=int(wyoming.get("stt_port", 10300)),
+            tts_port=int(wyoming.get("tts_port", 10200)),
+        ),
         reminders=RemindersConfig(
             url=str(reminders.get("url", "")).strip(),
             token=os.getenv("REMINDERS_TOKEN", "").strip(),

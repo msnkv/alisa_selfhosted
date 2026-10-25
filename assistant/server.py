@@ -190,6 +190,20 @@ class Brain:
 
         return transcript.text
 
+    def transcribe_samples(self, samples: np.ndarray) -> str:
+        """Готовый звук 16 кГц в текст. Для Wyoming, см. wyoming_server.py."""
+        if self.stt is None:
+            raise ValueError("распознавание выключено в config.yaml")
+        with self._lock:
+            return self.stt.transcribe(samples).text
+
+    def synthesize(self, text: str, speaker: str | None = None) -> np.ndarray:
+        """Текст в звук под общим замком. Для Wyoming."""
+        if self.tts is None:
+            raise ValueError("синтез выключен в config.yaml")
+        with self._lock:
+            return self.tts.synthesize(text, speaker)
+
     def stream_answer(self, question, *, body, suffix, session_id, cancelled, emit):
         """NDJSON: отдельный WAV на фразу, без сборки всего звука в памяти.
 
@@ -963,6 +977,15 @@ def serve(cfg, assistant, stt, tts) -> int:
     print(f"  с телефона:     http://<адрес этого ПК>:{cfg.server.port}/")
     print("  адрес ПК покажет команда ipconfig")
     print(f"  код для спутника: версия {update.local_version()}")
+    if cfg.wyoming.enabled:
+        # Импорт здесь: пакет wyoming нужен только когда это включено.
+        from . import wyoming_server
+
+        wyoming_server.start(brain, cfg)
+        print(
+            f"  для Home Assistant: распознавание — порт {cfg.wyoming.stt_port},"
+            f" синтез — {cfg.wyoming.tts_port}, агент — http://<ПК>:{cfg.server.port}/v1"
+        )
     if not cfg.server.token:
         # Говорим прямо: в data/ лежат гараж, рецепты и бюджет, и любой
         # в домашней сети может про них спросить. Это осознанный выбор,
