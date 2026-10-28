@@ -39,6 +39,7 @@ from .prompt import (
 from .search import EMPTY_RESULT_MARKER, SearchTools, make_backend
 from .streaming import check_cancelled
 from .reminder_dialogue import ReminderDialogue, INTENT as REMINDER_INTENT
+from .notes import NoteDialogue, note_request
 
 log = logging.getLogger(__name__)
 
@@ -189,6 +190,7 @@ class Assistant:
         self.long_form = False
         self.session_id = "local"
         self.reminders = ReminderDialogue(cfg.reminders)
+        self.notes = NoteDialogue(cfg.data_dir)
 
         # Журнал диалогов: по строке JSON на обмен, для разбора потом.
         # Пишется здесь, а не в голосовом цикле, намеренно: через ask
@@ -250,6 +252,7 @@ class Assistant:
         session.long_form = False
         session.session_id = session_id
         session.reminders = ReminderDialogue(self.cfg.reminders)
+        session.notes = NoteDialogue(self.cfg.data_dir)
         session.dialogue = DialogueLog(self.dialogue.path, enabled=self.dialogue.enabled)
         return session
 
@@ -296,19 +299,28 @@ class Assistant:
             name, data = self._parse_call(calls[0])
             return data if name == "propose_reminder" else None
 
-        reminder_text = self.reminders.handle(question, self.session_id, extract_reminder, cancel_event)
-        if reminder_text is not None:
-            answer = Answer(reminder_text, time.perf_counter() - reminder_started, tools_used=["reminder"])
+        # Заметки раньше напоминаний: «подтверждаю» у них общее, а
+        # реплика не про заметку сбрасывает черновик заметки и уходит дальше.
+        local_text, local_kind = self.notes.handle(question, cancel_event), "note"
+        if local_text is not None:
+            # Иначе старое «подтверждаю» сохранило бы и брошенное напоминание.
+            self.reminders.reset()
+        else:
+            local_text = self.reminders.handle(question, self.session_id, extract_reminder, cancel_event)
+            local_kind = "reminder"
+        if local_text is not None:
+            answer = Answer(local_text, time.perf_counter() - reminder_started, tools_used=[local_kind])
             try:
                 check_cancelled(cancel_event)
                 if on_sentence is not None:
-                    on_sentence(reminder_text)
+                    on_sentence(local_text)
                 if on_step is not None:
                     on_step(False)
                 check_cancelled(cancel_event)
             except BaseException:
                 # Не оставляем подтверждение, если предпросмотр не дошёл.
                 self.reminders.reset()
+                self.notes.reset()
                 raise
             self._remember(question, answer.text)
             self._log_turn(question, answer, None, False, False)
@@ -569,6 +581,7 @@ class Assistant:
         # Разговор тоже заканчивается: «забудь» — это сброс всего.
         self.long_form = False
         self.reminders.reset()
+        self.notes.reset()
         # И в журнале дальше идёт уже другая беседа.
         self.dialogue.new_conversation()
 
@@ -581,6 +594,8 @@ class Assistant:
         тишины — сперва вся генерация, и только потом звук.
         """
         if REMINDER_INTENT.search(question) or self.reminders.pending or self.reminders.context:
+            return False
+        if note_request(question) is not None or self.notes.active:
             return False
         if long_form_cancel(question):
             return False
