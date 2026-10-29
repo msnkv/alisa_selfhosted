@@ -1,0 +1,20 @@
+[Unit]
+Description=Alisa server (whisper, Silero, agent)
+Wants=network-online.target
+After=network-online.target alisa-reminders.service
+
+[Service]
+Type=simple
+# Заменить пользователя на своего.
+User=alisa
+WorkingDirectory=/opt/alisa_selfhosted
+Environment=PYTHONIOENCODING=utf-8
+# cuBLAS и cuDNN из pip: на Windows их находит _register_cuda_dlls в
+# assistant/stt.py, на Linux каталоги нужно назвать до старта процесса.
+Environment=LD_LIBRARY_PATH=/opt/alisa_selfhosted/.venv/lib/python3.10/site-packages/nvidia/cublas/lib:/opt/alisa_selfhosted/.venv/lib/python3.10/site-packages/nvidia/cudnn/lib
+ExecStart=/opt/alisa_selfhosted/.venv/bin/python -m assistant.cli --serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

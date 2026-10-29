@@ -1,0 +1,11 @@
+[Unit]
+Description=Alisa: check for updates every minute
+
+[Timer]
+OnBootSec=5min
+OnCalendar=minutely
+# Пропущенные запуски не догонять: важен следующий, а не все прошлые.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

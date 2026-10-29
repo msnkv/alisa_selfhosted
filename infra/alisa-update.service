@@ -1,0 +1,10 @@
+[Unit]
+Description=Alisa: git pull and restart when quiet
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# От root: перезапускает службы. git и pip скрипт сам зовёт от владельца
+# репозитория. Скрипт — копия в /usr/local/bin, см. alisa-update.sh.
+ExecStart=/usr/local/bin/alisa-update

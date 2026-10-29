@@ -238,6 +238,37 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(first.session_id.startswith("satellite:"))
         self.assertNotEqual(first.session_id, second.session_id)
 
+    def status(self, token="test-token"):
+        request = urllib.request.Request(self.url + "/status", headers={"X-Token": token})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_status_counts_talk_but_not_itself(self):
+        self.brain.activity.last_used -= 100
+        code, first = self.status()
+        self.assertEqual(code, 200)
+        self.assertEqual((first["working"], first["drafts"]), (0, 0))
+        self.assertGreaterEqual(first["idle_s"], 100)
+        self.assertTrue(first["version"])
+        # Сам /status простой не сбрасывает, а вопрос — сбрасывает.
+        self.assertGreaterEqual(self.status()[1]["idle_s"], 100)
+        self.post("telegram:123", text="Где инструмент?")
+        self.assertLess(self.status()[1]["idle_s"], 5)
+        self.assertEqual(self.status(token="wrong")[0], 403)
+
+    def test_status_reports_unconfirmed_note(self):
+        self.post("telegram:123", text="Запиши в заметки, что дрель у соседа")
+        self.assertEqual(self.status()[1]["drafts"], 1)
+        self.post("telegram:123", text="Отмена")
+        self.assertEqual(self.status()[1]["drafts"], 0)
+
+    def test_status_sees_answer_in_progress(self):
+        with self.brain._lock:
+            self.assertEqual(self.status()[1]["working"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

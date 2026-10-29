@@ -12,12 +12,13 @@ from types import SimpleNamespace as NS
 
 from openai import OpenAI
 
-from assistant.server import make_handler, openai_question, openai_session
+from assistant.server import Activity, make_handler, openai_question, openai_session
 
 
 class FakeBrain:
     def __init__(self):
         self.cfg = NS(name="тест")
+        self.activity = Activity()
         self.phrases = {}
         self.calls = []
 

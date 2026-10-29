@@ -8,6 +8,7 @@ Type=simple
 # Заменить пользователя и пути под свою постоянно включённую машину.
 User=alisa
 WorkingDirectory=/opt/alisa_selfhosted
+Environment=PYTHONIOENCODING=utf-8
 ExecStart=/opt/alisa_selfhosted/.venv/bin/python -m assistant.reminders
 Restart=always
 RestartSec=5

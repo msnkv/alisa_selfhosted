@@ -4,6 +4,11 @@
 службы напоминаний. Настройка описана в [REMINDERS.md](../REMINDERS.md).
 Шаблон подготовлен, на внешней машине служба автоматически не установлена.
 
+`alisa-server.service`, `alisa-telegram.service` — сервер и бот на
+отдельном ПК с Ubuntu. `alisa-update.sh` с `alisa-update.service` и
+`alisa-update.timer` — автообновление из git в тишине с откатом. Как
+ставить и как это устроено — [MIGRATION.md](../MIGRATION.md).
+
 ## SearXNG для VDS (пока не используется)
 
 Здесь лежит конфиг SearXNG — своего поискового движка без аккаунтов и тарифов.

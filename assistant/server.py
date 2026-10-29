@@ -61,6 +61,41 @@ MAX_SESSIONS = 128
 SESSION_IDLE_S = 24 * 60 * 60
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 
+# Адреса, обращение к которым считается разговором. /status, /health и
+# обновление спутника — нет: спутник спрашивает манифест каждые две
+# минуты, и иначе сервер никогда не выглядел бы простаивающим.
+WORK_PATHS = ("/ask", "/ask-stream", "/forget", "/v1/chat/completions")
+
+
+class Activity:
+    """Сколько запросов идёт сейчас и когда закончился последний.
+
+    Нужно автообновлению (infra/alisa-update.sh): перезапуск сервера
+    сбрасывает модели и беседы в памяти, поэтому делать его можно
+    только в тишине. Отсчёт начинается с запуска — сразу после
+    рестарта сервер тоже не «простаивает», это заодно защищает от
+    перезапусков по кругу.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.working = 0
+        self.last_used = time.monotonic()
+
+    def __enter__(self):
+        with self._lock:
+            self.working += 1
+        return self
+
+    def __exit__(self, *exc) -> None:
+        with self._lock:
+            self.working -= 1
+            self.last_used = time.monotonic()
+
+    def snapshot(self) -> tuple[int, float]:
+        with self._lock:
+            return self.working, time.monotonic() - self.last_used
+
 
 def encode_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     """Переводит float32 от Silero в WAV, который умеет играть всё.
@@ -95,6 +130,7 @@ class Brain:
         self.tts = tts
         self._lock = threading.Lock()
         self.requests = Requests()
+        self.activity = Activity()
         self._sessions: OrderedDict[str, tuple[Assistant, float]] = OrderedDict()
         # Короткие служебные фразы готовятся здесь, а играет их спутник.
         # Синтеза у него нет и быть не должно, но молчать он тоже не
@@ -194,15 +230,37 @@ class Brain:
         """Готовый звук 16 кГц в текст. Для Wyoming, см. wyoming_server.py."""
         if self.stt is None:
             raise ValueError("распознавание выключено в config.yaml")
-        with self._lock:
+        with self.activity, self._lock:
             return self.stt.transcribe(samples).text
 
     def synthesize(self, text: str, speaker: str | None = None) -> np.ndarray:
         """Текст в звук под общим замком. Для Wyoming."""
         if self.tts is None:
             raise ValueError("синтез выключен в config.yaml")
-        with self._lock:
+        with self.activity, self._lock:
             return self.tts.synthesize(text, speaker)
+
+    def status(self) -> dict:
+        """Можно ли сейчас перезапустить сервер, не помешав разговору.
+
+        Неподтверждённая заметка или напоминание тоже считаются: они
+        живут в памяти, и перезапуск молча выбросил бы «подтверждаю».
+        """
+        working, idle_s = self.activity.snapshot()
+        drafts = 0
+        # Замок занят — значит, идёт ответ; ждать его ради счёта
+        # черновиков незачем.
+        if self._lock.acquire(blocking=False):
+            try:
+                now = time.monotonic()
+                drafts = sum(
+                    _has_draft(assistant, now) for assistant, _ in self._sessions.values()
+                )
+            finally:
+                self._lock.release()
+        else:
+            working = max(working, 1)
+        return {"working": working, "idle_s": round(idle_s, 1), "drafts": drafts}
 
     def stream_answer(self, question, *, body, suffix, session_id, cancelled, emit):
         """NDJSON: отдельный WAV на фразу, без сборки всего звука в памяти.
@@ -325,6 +383,16 @@ class Brain:
     def forget(self, session_id: str = LEGACY_SESSION) -> None:
         with self._lock:
             self._session(session_id).forget()
+
+
+def _has_draft(assistant, now: float) -> bool:
+    """Ждёт ли сессия «подтверждаю» по заметке или напоминанию."""
+    notes = getattr(assistant, "notes", None)
+    reminders = getattr(assistant, "reminders", None)
+    return bool(
+        (notes is not None and notes.active and notes.expires > now)
+        or (reminders is not None and reminders.pending and reminders.expires > now)
+    )
 
 
 PAGE = """<!doctype html>
@@ -777,6 +845,13 @@ def make_handler(brain: Brain, token: str):
             if parts.path == "/health":
                 self._send(200, b"ok\n", "text/plain; charset=utf-8")
                 return
+            if parts.path == "/status":
+                # Для автообновления: можно ли перезапуститься сейчас.
+                if not self._allowed(query):
+                    self._send_json(403, {"error": "нужен токен"})
+                    return
+                self._send_json(200, {**brain.status(), "version": client_version})
+                return
             if parts.path == "/phrases":
                 # Спутник забирает их один раз при запуске и держит в
                 # памяти: играть надо мгновенно, а не качать каждый раз.
@@ -828,7 +903,13 @@ def make_handler(brain: Brain, token: str):
         def do_POST(self) -> None:  # noqa: N802
             parts = urlsplit(self.path)
             query = parse_qs(parts.query)
+            if parts.path in WORK_PATHS:
+                with brain.activity:
+                    self._post(parts, query)
+            else:
+                self._post(parts, query)
 
+        def _post(self, parts, query) -> None:
             if parts.path == "/v1/chat/completions":
                 if not self._allowed(query):
                     self._send_json(401, {"error": {"message": "нужен токен"}})

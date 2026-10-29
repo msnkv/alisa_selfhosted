@@ -1,0 +1,8 @@
+# Скопировать в /etc/alisa-update.conf и поправить. Без файла действуют
+# значения по умолчанию из alisa-update.sh.
+ROOT=/opt/alisa_selfhosted
+BRANCH=master
+QUIET_S=120
+HEALTH_WAIT_S=300
+SETTLE_S=30
+NOTIFY=1
