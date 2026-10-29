@@ -71,6 +71,7 @@ class STTConfig:
     language: str
     beam_size: int
     vad_filter: bool
+    hotwords: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -298,6 +299,7 @@ def load_config(path: Path | None = None) -> Config:
             language=stt.get("language", "ru"),
             beam_size=int(stt.get("beam_size", 1)),
             vad_filter=bool(stt.get("vad_filter", True)),
+            hotwords=tuple(str(w) for w in stt.get("hotwords") or ()),
         ),
         mic=MicConfig(
             input_device=mic.get("input_device"),

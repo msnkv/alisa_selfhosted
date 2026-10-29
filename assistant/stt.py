@@ -96,6 +96,7 @@ class WhisperSTT:
         language: str = "ru",
         beam_size: int = 1,
         vad_filter: bool = True,
+        hotwords: tuple[str, ...] = (),
         models_dir: Path | None = None,
     ) -> None:
         self.model_name = model
@@ -104,6 +105,9 @@ class WhisperSTT:
         self.language = language
         self.beam_size = beam_size
         self.vad_filter = vad_filter
+        # Редкие слова из data/ одной строкой: whisper получает их как
+        # «предыдущий текст» и склоняется к ним на похожем звуке.
+        self.hotwords = ", ".join(hotwords) or None
         self.models_dir = models_dir
         self._model = None
         # Что в итоге заработало — пригодится в селфтесте и логах.
@@ -228,6 +232,7 @@ class WhisperSTT:
             # Без этого Whisper на тишине и шуме любит выдумывать фразы
             # вроде «Субтитры сделал DimaTorzok».
             condition_on_previous_text=False,
+            hotwords=self.hotwords,
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
         elapsed = time.perf_counter() - started
@@ -265,5 +270,6 @@ def make_stt(cfg) -> WhisperSTT:
         language=cfg.stt.language,
         beam_size=cfg.stt.beam_size,
         vad_filter=cfg.stt.vad_filter,
+        hotwords=cfg.stt.hotwords,
         models_dir=cfg.models_dir,
     )
