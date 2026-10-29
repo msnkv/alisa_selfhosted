@@ -852,4 +852,7 @@ class Assistant:
         # в лог: если промахов много, значит правило надо усиливать.
         if re.search(r"\d", answer.text):
             log.warning("в ответе остались цифры, синтезатор прочитает их криво: %s", answer.text)
+        # То же с латиницей: синтез переведёт её в кириллицу сам, но коряво.
+        if re.search(r"[A-Za-z]", answer.text):
+            log.warning("в ответе латиница, синтезатор прочитает её криво: %s", answer.text)
         return answer

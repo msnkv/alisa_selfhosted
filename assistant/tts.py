@@ -55,6 +55,98 @@ SPEAKERS = ("aidar", "baya", "kseniya", "xenia", "eugene")
 # Фраза для образцов голосов: тут и числа словами, и вопрос в конце,
 # и шипящие — слышно, как голос справляется с тем, что ему реально дадут.
 
+# Латиницу русская модель Silero молча выбрасывает: «живёт с Linux и VPN»
+# звучало как «живёт с и». Поймано в Telegram 29.10.2026. Главное лечение
+# — правило в промпте, а это страховка на промах: коряво, но не дыра.
+# Частые слова — словарём, аббревиатуры из заглавных — по буквам,
+# остальное — побуквенно с английскими сочетаниями вроде sh и th.
+_LATIN_WORDS = {
+    "linux": "линукс", "windows": "виндоус", "ubuntu": "убунту",
+    "wi-fi": "вай-фай", "wifi": "вайфай", "bluetooth": "блютус",
+    "telegram": "телеграм", "youtube": "ютуб", "google": "гугл",
+    "yandex": "яндекс", "deepseek": "дипсик", "docker": "докер",
+    "home": "хоум", "assistant": "ассистант", "ok": "окей", "okay": "окей",
+    "email": "имейл", "e-mail": "имейл", "online": "онлайн",
+    "offline": "офлайн", "iphone": "айфон", "android": "андроид",
+    "apple": "эппл", "xiaomi": "сяоми", "python": "питон",
+    "vpn": "вэпээн", "usb": "ю-эс-би", "gpu": "джи-пи-ю", "cpu": "си-пи-ю",
+    "ssd": "эс-эс-дэ", "hdmi": "эйч-ди-эм-ай", "pdf": "пэ-дэ-эф",
+    "ai": "эй-ай", "it": "ай-ти", "tv": "ти-ви", "pc": "пи-си",
+}
+_LATIN_LETTERS = {
+    "a": "эй", "b": "би", "c": "си", "d": "ди", "e": "и", "f": "эф",
+    "g": "джи", "h": "эйч", "i": "ай", "j": "джей", "k": "кей", "l": "эл",
+    "m": "эм", "n": "эн", "o": "оу", "p": "пи", "q": "кью", "r": "ар",
+    "s": "эс", "t": "ти", "u": "ю", "v": "ви", "w": "дабл-ю", "x": "икс",
+    "y": "уай", "z": "зет",
+}
+_LATIN_PAIRS = {
+    "sh": "ш", "ch": "ч", "th": "т", "ph": "ф", "ck": "к", "oo": "у",
+    "ee": "и", "kh": "х", "zh": "ж", "ts": "ц", "qu": "кв",
+}
+_LATIN_SINGLE = {
+    "a": "а", "b": "б", "c": "к", "d": "д", "e": "е", "f": "ф", "g": "г",
+    "h": "х", "i": "и", "j": "дж", "k": "к", "l": "л", "m": "м", "n": "н",
+    "o": "о", "p": "п", "q": "к", "r": "р", "s": "с", "t": "т", "u": "у",
+    "v": "в", "w": "в", "x": "кс", "y": "и", "z": "з",
+}
+_LATIN_WORD = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)*")
+_HAS_LATIN = re.compile(r"[A-Za-z]")
+
+
+def has_latin(text: str) -> bool:
+    return bool(_HAS_LATIN.search(text))
+
+
+def _spell_word(word: str) -> str:
+    """Побуквенно, как прочитал бы русский: Ubuntu — убунту."""
+    word = word.lower()
+    # Немое e на конце: make — мейк не выйдет, но хотя бы не «маке».
+    if len(word) > 3 and word.endswith("e") and word[-2] not in "aeiouy":
+        word = word[:-1]
+    out = []
+    i = 0
+    while i < len(word):
+        if word.startswith("sch", i):
+            out.append("ш")
+            i += 3
+            continue
+        pair = word[i:i + 2]
+        if pair in _LATIN_PAIRS:
+            out.append(_LATIN_PAIRS[pair])
+            i += 2
+            continue
+        char = word[i]
+        nxt = word[i + 1:i + 2]
+        if char == "c" and nxt and nxt in "eiy":
+            out.append("с")
+        elif char == "e" and i == 0:
+            out.append("э")
+        elif char == "y" and i > 0 and word[i - 1] in "aeiou":
+            out.append("й")
+        else:
+            out.append(_LATIN_SINGLE.get(char, ""))
+        i += 1
+    return "".join(out)
+
+
+def _read_latin(match: re.Match) -> str:
+    word = match.group(0)
+    known = _LATIN_WORDS.get(word.lower())
+    if known:
+        return known
+    if len(word) <= 5 and word.isupper():
+        return "-".join(_LATIN_LETTERS[c] for c in word.lower())
+    return "-".join(_spell_word(part) for part in word.split("-"))
+
+
+def latin_to_cyrillic(text: str) -> str:
+    """Латинские слова русскими буквами, чтобы Silero их не проглотил."""
+    if not has_latin(text):
+        return text
+    return _LATIN_WORD.sub(_read_latin, text)
+
+
 def split_for_synthesis(text: str, limit: int = MAX_SYNTH_CHARS) -> list[str]:
     """Режет текст на куски, которые Silero осилит за один вызов.
 
@@ -204,7 +296,7 @@ class SileroTTS:
         задумано: предел принадлежит Silero, значит и обходить его
         должна обёртка Silero, а не каждый вызывающий по отдельности.
         """
-        text = text.strip()
+        text = latin_to_cyrillic(text.strip())
         if not text:
             return np.zeros(0, dtype=np.float32)
 

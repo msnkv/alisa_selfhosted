@@ -65,6 +65,11 @@ def evaluate(case: dict, answer: Answer, max_words: int) -> tuple[list[str], lis
     if found_digits:
         failures.append("цифры вместо слов: " + ", ".join(found_digits[:4]))
 
+    # Латиницу Silero глотает молча, страховка в синтезе читает её коряво.
+    found_latin = re.findall(r"[A-Za-z]+", text)
+    if found_latin:
+        failures.append("латиница вместо русских букв: " + ", ".join(found_latin[:4]))
+
     expected_tools = str(case.get("tools", "any")).lower()
     used = bool(answer.tools_used)
     if expected_tools == "no" and used:
