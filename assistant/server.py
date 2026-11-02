@@ -44,7 +44,7 @@ import numpy as np
 from . import update
 from .prompt import FORGOTTEN_REPLY, is_forget
 from .streaming import AnswerCancelled, Requests, check_cancelled
-from .tts import split_for_synthesis
+from .tts import MAX_SYNTH_CHARS, split_for_synthesis
 
 if TYPE_CHECKING:
     from .llm import Assistant
@@ -65,6 +65,10 @@ SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 # обновление спутника — нет: спутник спрашивает манифест каждые две
 # минуты, и иначе сервер никогда не выглядел бы простаивающим.
 WORK_PATHS = ("/ask", "/ask-stream", "/forget", "/v1/chat/completions")
+
+# После первой фразы сказки собираем несколько предложений в один
+# вызов Silero: меньше отдельных дорожек — меньше слышимых швов.
+STREAM_BLOCK_CHARS = 300
 
 
 class Activity:
@@ -263,10 +267,11 @@ class Brain:
         return {"working": working, "idle_s": round(idle_s, 1), "drafts": drafts}
 
     def stream_answer(self, question, *, body, suffix, session_id, cancelled, emit):
-        """NDJSON: отдельный WAV на фразу, без сборки всего звука в памяти.
+        """NDJSON: отдельный WAV на блок текста.
 
-        Обычный ответ разрешаем после финального шага; у сказки инструментов
-        нет, поэтому можно передавать фразы ещё во время генерации.
+        Обычный ответ синтезируем целиком после финального шага (в пределах
+        лимита Silero). У сказки сразу отдаём первую фразу, затем собираем
+        более крупные блоки, пока модель продолжает генерацию.
         """
         check_cancelled(cancelled)
         if question is None:
@@ -296,12 +301,25 @@ class Brain:
                     emit(event)
                     spoken_count += 1
 
+            def flush_pending():
+                if pending:
+                    text = " ".join(pending)
+                    pending.clear()
+                    say(text)
+
             def sentence(text):
                 check_cancelled(cancelled)
-                if committed:
+                if not committed:
+                    pending.append(text)
+                elif not spoken_count:
+                    # Быстрый первый звук в режиме сказки сохраняем.
                     say(text)
                 else:
+                    if pending and len(" ".join([*pending, text])) > MAX_SYNTH_CHARS:
+                        flush_pending()
                     pending.append(text)
+                    if len(" ".join(pending)) >= STREAM_BLOCK_CHARS:
+                        flush_pending()
 
             def step(used_tools):
                 nonlocal committed
@@ -309,9 +327,7 @@ class Brain:
                     pending.clear()
                 else:
                     committed = True
-                    for text in pending:
-                        say(text)
-                    pending.clear()
+                    flush_pending()
 
             if not question or is_forget(question):
                 if question:
@@ -327,6 +343,8 @@ class Brain:
                     on_tool_call=lambda name, args: emit({"type": "search"}),
                 )
                 check_cancelled(cancelled)
+                if committed:
+                    flush_pending()
                 if not spoken_count:
                     say(answer.text)
                 emit({"type": "done", "text": answer.text, "seconds": answer.seconds, "tools": answer.tools_used})

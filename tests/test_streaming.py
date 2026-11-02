@@ -100,8 +100,39 @@ class StreamingTests(unittest.TestCase):
         self.assertFalse(self.tts.synthesize.called)
         self.release.set()
         events = self.rest(response)
-        self.assertEqual(len([e for e in events if e["type"] == "sentence"]), 2)
+        sentences = [e for e in events if e["type"] == "sentence"]
+        self.assertEqual([e["text"] for e in sentences], ["Первая фраза. Вторая фраза."])
+        self.tts.synthesize.assert_called_once_with("Первая фраза. Вторая фраза.")
         self.assertEqual(events[-1]["type"], "done")
+
+    def test_story_groups_later_sentences_and_flushes_short_tail(self):
+        first = "Начало сказки."
+        middle = "Герой шёл через лес."
+        tail = "И пришёл домой."
+        # Блок набирается до окончания генерации, остаток не теряется.
+        def generate():
+            yield chunk(first + " ")
+            for _ in range(16):
+                yield chunk(middle + " ")
+            self.assertEqual(self.tts.synthesize.call_count, 2,
+                             "продолжение сказки должно звучать до конца генерации")
+            yield chunk(tail)
+
+        with patch.object(Assistant, "_call_api", return_value=generate()):
+            events = self.rest(self.open())
+        texts = [e["text"] for e in events if e["type"] == "sentence"]
+        self.assertEqual(texts, [first, " ".join([middle] * 15), middle + " " + tail])
+        self.assertEqual(" ".join(texts), events[-1]["text"])
+
+    def test_ordinary_long_answer_respects_silero_limit(self):
+        sentence = "Герой шёл через лес."
+        text = " ".join([sentence] * 40)
+        with patch.object(Assistant, "_call_api", return_value=iter([chunk(text)])):
+            events = self.rest(self.open(text="Где инструмент?"))
+        texts = [e["text"] for e in events if e["type"] == "sentence"]
+        self.assertGreater(len(texts), 1)
+        self.assertTrue(all(len(t) <= 600 for t in texts))
+        self.assertEqual(" ".join(texts), text)
 
     def test_tool_step_text_is_discarded(self):
         tools = NS(SCHEMAS=[{"type": "function", "function": {"name": "web_search"}}], call=Mock(return_value="найдено"))
