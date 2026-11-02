@@ -27,8 +27,6 @@ NOTIFY=1             # писать владельцу в Telegram об обно
 # shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
 
-declare -A RESTARTS_BEFORE=()
-
 OWNER=$(stat -c %U "$ROOT")
 PY="$ROOT/.venv/bin/python"
 STATE="$ROOT/state"
@@ -97,18 +95,14 @@ install_requirements() {
 }
 
 restart_all() {
-    local unit
-    # Счётчик NRestarts может быть ненулевым из-за старых сбоев запуска.
-    # Сохраняем его перед штатным рестартом и проверяем только прирост.
-    for unit in $SERVICES; do
-        RESTARTS_BEFORE["$unit"]=$(systemctl show -p NRestarts --value "$unit")
-    done
+    # Штатный restart сбрасывает NRestarts. Проверяем только сбои нового
+    # запуска: сравнение со старым счётчиком давало ложный откат при 1 -> 0.
     # shellcheck disable=SC2086
     systemctl restart $SERVICES
 }
 
 healthy() {
-    local port waited=0 unit restarts_before restarts_after
+    local port waited=0 unit restarts_after
     port=$(cd "$ROOT" && as_owner "$PY" - <<'EOF'
 import sys
 from contextlib import redirect_stdout
@@ -128,11 +122,11 @@ EOF
     sleep "$SETTLE_S"
     for unit in $SERVICES; do
         # Restart=always поднимает упавшую службу сама, поэтому «active»
-        # мало: смотрим, не вырос ли счётчик после нашего рестарта.
-        restarts_before=${RESTARTS_BEFORE["$unit"]-0}
+        # мало: после штатного restart любой NRestarts > 0 — новый сбой,
+        # даже если он случился до первой проверки здоровья.
         restarts_after=$(systemctl show -p NRestarts --value "$unit")
         if [ "$(systemctl show -p ActiveState --value "$unit")" != active ] ||
-           [ "$restarts_after" != "$restarts_before" ]; then
+           [ "$restarts_after" -ne 0 ]; then
             log "$unit не держится"
             return 1
         fi

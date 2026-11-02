@@ -69,25 +69,43 @@ class AutoUpdateTests(unittest.TestCase):
 
         self.addCleanup(close)
 
-    def run_function(self, name, **overrides):
+    def run_function(self, name, restart_first=False, **overrides):
         script = SCRIPT.read_text(encoding="utf-8")
-        start = script.index(f"\n{name}() {{\n") + 1
-        end = script.index("\n}\n", start) + 3
+        functions = []
+        for function in (["restart_all", name] if restart_first else [name]):
+            start = script.index(f"\n{function}() {{\n") + 1
+            end = script.index("\n}\n", start) + 3
+            functions.append(script[start:end])
         program = (
             "set -euo pipefail\n"
             f"ROOT={shlex.quote(self.root.as_posix())}\n"
             f"PY={shlex.quote(Path(sys.executable).as_posix())}\n"
             "QUIET_S=120\nHEALTH_WAIT_S=5\nSETTLE_S=0\n"
             "SERVICES='alisa-reminders alisa-server alisa-telegram'\n"
-            "declare -A RESTARTS_BEFORE=()\n"
+            "printf '%s\\n' \"${UPDATE_TEST_RESTARTS_BEFORE:-0}\" > \"$ROOT/restarts\"\n"
             "as_owner() { \"$@\"; }\n"
             "log() { printf '%s\\n' \"$*\" >&2; }\n"
             "sleep() { :; }\n"
             # Проверяем точный URL, который получила бы настоящая curl.
             "curl() { [[ \"${@: -1}\" == \"http://127.0.0.1:$UPDATE_TEST_PORT/health\" ]]; }\n"
-            "systemctl() { case \"$*\" in *NRestarts*) echo 0;; *ActiveState*) echo active;; "
-            "*) return 1;; esac; }\n"
-            + script[start:end] + f"\n{name}\n"
+            "systemctl() {\n"
+            "  case \"$1\" in\n"
+            "    restart) printf '%s\\n' \"${UPDATE_TEST_RESTARTS_AFTER:-0}\" > \"$ROOT/restarts\";;\n"
+            "    show)\n"
+            "      if [[ \"${@: -1}\" != alisa-telegram ]]; then\n"
+            "        case \"$*\" in *NRestarts*) echo 0;; *ActiveState*) echo active;; esac\n"
+            "      else\n"
+            "        case \"$*\" in\n"
+            "          *NRestarts*) cat \"$ROOT/restarts\";;\n"
+            "          *ActiveState*) echo \"${UPDATE_TEST_SERVICE_STATE:-active}\";;\n"
+            "          *) return 1;;\n"
+            "        esac\n"
+            "      fi;;\n"
+            "    *) return 1;;\n"
+            "  esac\n"
+            "}\n"
+            + "\n".join(functions)
+            + ("\nrestart_all" if restart_first else "") + f"\n{name}\n"
         )
         env = {**os.environ, "UPDATE_TEST_PORT": str(self.server.server_port),
                "PYTHONIOENCODING": "utf-8", **overrides}
@@ -127,6 +145,25 @@ class AutoUpdateTests(unittest.TestCase):
         result = self.run_function("healthy", UPDATE_TEST_BAD_CONFIG="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
+
+    def test_planned_restart_clears_old_failures_without_rollback(self):
+        result = self.run_function("healthy", restart_first=True,
+                                   UPDATE_TEST_RESTARTS_BEFORE="1", UPDATE_TEST_RESTARTS_AFTER="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_new_crash_is_rejected_even_if_counter_matches_old_value(self):
+        for previous in ("0", "1", "7"):
+            with self.subTest(previous=previous):
+                result = self.run_function("healthy", restart_first=True,
+                                           UPDATE_TEST_RESTARTS_BEFORE=previous,
+                                           UPDATE_TEST_RESTARTS_AFTER="1")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("alisa-telegram не держится", result.stderr)
+
+    def test_inactive_service_is_rejected_without_any_restarts(self):
+        result = self.run_function("healthy", restart_first=True, UPDATE_TEST_SERVICE_STATE="failed")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("alisa-telegram не держится", result.stderr)
 
 
 if __name__ == "__main__":
