@@ -60,9 +60,12 @@ notify() {
 server_state() {
     (cd "$ROOT" && as_owner "$PY" - "$QUIET_S" 2>/dev/null) <<'EOF' || echo unknown
 import json, sys, urllib.error, urllib.request
+from contextlib import redirect_stdout
 from assistant.config import load_config
 
-cfg = load_config()
+# stdout — протокол для bash, сообщения загрузчика туда не входят.
+with redirect_stdout(sys.stderr):
+    cfg = load_config()
 quiet_s = float(sys.argv[1])
 request = urllib.request.Request(
     f"http://127.0.0.1:{cfg.server.port}/status",
@@ -106,8 +109,16 @@ restart_all() {
 
 healthy() {
     local port waited=0 unit restarts_before restarts_after
-    port=$(cd "$ROOT" && as_owner "$PY" -c \
-        "from assistant.config import load_config; print(load_config().server.port)") || return 1
+    port=$(cd "$ROOT" && as_owner "$PY" - <<'EOF'
+import sys
+from contextlib import redirect_stdout
+from assistant.config import load_config
+
+with redirect_stdout(sys.stderr):
+    cfg = load_config()
+print(cfg.server.port)
+EOF
+    ) || return 1
     # /health отвечает только после прогрева моделей: раньше сервер не слушает.
     until curl -sf --max-time 5 "http://127.0.0.1:$port/health" >/dev/null; do
         waited=$((waited + 5))
