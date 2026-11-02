@@ -17,7 +17,7 @@
 set -euo pipefail
 
 CONF=${ALISA_UPDATE_CONF:-/etc/alisa-update.conf}
-ROOT=/opt/alisa_selfhosted
+ROOT=/home/chupep/dimarep
 BRANCH=master
 QUIET_S=120          # столько секунд без вопросов, чтобы перезапускать
 HEALTH_WAIT_S=300    # столько ждём, пока сервер прогреет модели

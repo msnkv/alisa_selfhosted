@@ -7,9 +7,9 @@ After=network-online.target alisa-server.service
 Type=simple
 # Заменить пользователя на своего.
 User=alisa
-WorkingDirectory=/opt/alisa_selfhosted
+WorkingDirectory=/home/chupep/dimarep
 Environment=PYTHONIOENCODING=utf-8
-ExecStart=/opt/alisa_selfhosted/.venv/bin/python -m assistant.telegram_bot
+ExecStart=/home/chupep/dimarep/.venv/bin/python -m assistant.telegram_bot
 Restart=always
 RestartSec=5
 

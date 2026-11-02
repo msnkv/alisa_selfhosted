@@ -1,7 +1,17 @@
-# Переезд сервера на отдельный ПК с Ubuntu
+# Переезд сервера на отдельный ПК с Ubuntu 26.04.1 LTS
 
-План от 29.10.2026. **Ещё не выполнялся**: на Linux проект не запускался
-ни разу. Всё, что ниже помечено «не проверено», проверять первым.
+План подготовлен 29.10.2026 и уточнён 02.11.2026 под фактическую машину.
+**На 02.11.2026 код, данные, модели и Python-зависимости перенесены;
+самопроверка на Linux прошла.** Сервер и служба напоминаний на домашнем
+ПК работают, `/health` отвечает `ok`. Telegram-бот остаётся на домашнем
+ПК, его systemd-служба включена, владелец проверил переписку. Один раз
+возникла ошибка скачивания голосового; разбор отложен по просьбе владельца.
+
+Фактическое состояние: Ubuntu 26.04.1 LTS, GTX 1650 4 ГБ, драйвер
+595.99 (CUDA 13.2), системный Python 3.14.4, часовой пояс Europe/Moscow.
+Каталог проекта выбран `/home/chupep/dimarep`; он уже создан и принадлежит
+пользователю `chupep`. Для приложения по-прежнему используем Python 3.10
+в отдельном окружении uv, как закреплено ниже.
 
 Цель: сервер (`--serve`), Telegram-бот и служба напоминаний живут на новом
 ПК круглосуточно. Рабочий ПК с 5060 Ti в схеме не участвует и может быть
@@ -31,12 +41,12 @@
 
 ## Шаг 1. Машина
 
-1. Ubuntu 24.04 LTS. **Одна система, без второй рядом**: после
+1. Ubuntu 26.04.1 LTS уже установлена. **Одна система, без второй рядом**: после
    отключения света загрузчик не должен выбрать Windows. Если вторая
    система всё же будет — в GRUB по умолчанию Ubuntu.
 2. BIOS (ASUS PRIME B560): Advanced → APM → **Restore AC Power Loss →
-   Power On**. Пропал свет — ПК поднялся сам.
-3. Сон выключить:
+   Power On**. Пропал свет — ПК поднялся сам. Ещё не проверено.
+3. Сон пока не замаскирован. Выполнить:
    ```sh
    sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
    ```
@@ -44,17 +54,23 @@
    ```sh
    sudo timedatectl set-timezone Europe/Moscow
    ```
-5. SSH, чтобы работать с основного ПК:
+5. SSH с основного ПК уже работает по ключу. Остальные нужные системные
+   зависимости установить:
    ```sh
-   sudo apt install openssh-server git curl libportaudio2
+   sudo apt update
+   sudo apt install git curl libportaudio2
    ```
    `libportaudio2` нужен `sounddevice`: на Windows библиотека лежит
    внутри колеса, на Linux — нет.
-6. В роутере закрепить за ПК постоянный адрес. Проще всего —
-   **`192.168.31.35`**, когда старый сервер выключен: тогда
-   `config.local.yaml` на спутнике трогать не надо.
+6. В роутере закрепить за ПК постоянный адрес. Сейчас сервер доступен по
+   `192.168.31.172`; DHCP-резервация ещё не подтверждена. После неё
+   обновить адрес на спутнике, если роутер назначит другой.
 
 ## Шаг 2. Драйвер NVIDIA
+
+Проверено 02.11.2026: `nvidia-smi` показывает GTX 1650, драйвер 595.99
+и CUDA 13.2. Переустанавливать драйвер не нужно. Если после обновления
+Ubuntu драйвер пропадёт, восстановить штатным способом:
 
 ```sh
 sudo ubuntu-drivers install
@@ -62,29 +78,32 @@ sudo reboot
 nvidia-smi
 ```
 
-`nvidia-smi` должен показать GTX 1650 и версию CUDA не ниже 12.8 — под неё
-собран torch (`cu128`). CUDA Toolkit ставить не надо: cuBLAS и cuDNN
-приходят пакетами pip, как на Windows.
+PyTorch для Silero установлен в CPU-варианте: TTS настроен на CPU, поэтому
+CUDA-сборка PyTorch не нужна. Whisper работает на GPU через CTranslate2;
+его cuBLAS и cuDNN приходят отдельными пакетами pip. CUDA Toolkit ставить
+не надо. На этой машине проверено: один CUDA-адаптер, GTX 1650, режим
+`cuda/int8_float16`.
 
 ## Шаг 3. Код и окружение
 
 ```sh
-sudo mkdir -p /opt/alisa_selfhosted && sudo chown $USER: /opt/alisa_selfhosted
-git clone https://github.com/msnkv/alisa_selfhosted.git /opt/alisa_selfhosted
-cd /opt/alisa_selfhosted
+ROOT=/home/chupep/dimarep
+git clone https://github.com/msnkv/alisa_selfhosted.git "$ROOT"
+cd "$ROOT"
 ```
 
 Если репозиторий приватный — завести на сервере ключ SSH и добавить его в
 GitHub как **deploy key только на чтение**: сервер должен уметь `pull`, но
 не `push`.
 
-Python **3.10**, как на рабочем ПК. В Ubuntu 24.04 стоит 3.12, а наши
-закреплённые версии на нём не проверялись. Ставим через `uv`:
+Python **3.10**, как на рабочем ПК. В Ubuntu 26.04.1 системный Python
+3.14.4; для проекта `uv` установит отдельный Python 3.10, чтобы
+сохранить проверенные версии зависимостей:
 
 ```sh
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv --python 3.10 --seed .venv
-.venv/bin/python -m pip install torch==2.11.0 torchaudio --index-url https://download.pytorch.org/whl/cu128
+.venv/bin/python -m pip install torch==2.11.0 torchaudio --index-url https://download.pytorch.org/whl/cpu
 grep -v pywebrtc requirements.txt > /tmp/req-server.txt
 .venv/bin/python -m pip install -r /tmp/req-server.txt -r requirements-telegram.txt
 ```
@@ -141,10 +160,11 @@ reminders:
 найден». На Linux каталоги задаются переменной до старта процесса:
 
 ```sh
-export LD_LIBRARY_PATH=/opt/alisa_selfhosted/.venv/lib/python3.10/site-packages/nvidia/cublas/lib:/opt/alisa_selfhosted/.venv/lib/python3.10/site-packages/nvidia/cudnn/lib
+export LD_LIBRARY_PATH=/home/chupep/dimarep/.venv/lib/python3.10/site-packages/nvidia/cublas/lib:/home/chupep/dimarep/.venv/lib/python3.10/site-packages/nvidia/cudnn/lib
 ```
 
-В службе systemd она прописана ниже. Не проверено вживую.
+В службе systemd она прописана ниже. Проверено самопроверкой: faster-whisper
+загрузил модель и распознал фразу на GTX 1650 в режиме `cuda/int8_float16`.
 
 ## Шаг 6. Проверка руками
 
@@ -161,13 +181,14 @@ export PYTHONIOENCODING=utf-8
 ## Шаг 7. Службы systemd
 
 Готовые файлы лежат в `infra/`: `alisa-server.service`,
-`alisa-telegram.service`, `alisa-reminders.service`. В каждом
-`User=alisa` заменить на своего пользователя Ubuntu.
+`alisa-telegram.service` и `alisa-reminders.service`. В каждом
+`User=alisa` заменить на `chupep`, а старый путь `/opt/alisa_selfhosted`
+заменить на `/home/chupep/dimarep`.
 
 ```sh
-cd /opt/alisa_selfhosted
+cd /home/chupep/dimarep
 for unit in alisa-server alisa-telegram alisa-reminders; do
-    sed "s/^User=alisa$/User=$USER/" infra/$unit.service | sudo tee /etc/systemd/system/$unit.service >/dev/null
+    sed -e "s/^User=alisa$/User=$USER/" -e "s|/opt/alisa_selfhosted|/home/chupep/dimarep|g" infra/$unit.service | sudo tee /etc/systemd/system/$unit.service >/dev/null
 done
 mkdir -p state
 sudo systemctl daemon-reload
@@ -187,12 +208,11 @@ journalctl -u alisa-server -f
 ```sh
 sudo ufw allow OpenSSH
 sudo ufw allow from 192.168.31.0/24 to any port 8765 proto tcp
-sudo ufw allow from 192.168.31.0/24 to any port 10200 proto tcp
-sudo ufw allow from 192.168.31.0/24 to any port 10300 proto tcp
-sudo ufw enable
 ```
 
-**SSH разрешить до `enable`**, иначе отрежешь себя от машины. Порт
+UFW на сервере уже включён; SSH уже разрешён. Осталось добавить разрешение
+на порт 8765 только из домашней сети. Порты Wyoming не открываем до этапа 3.
+Порт
 напоминаний 8766 не открываем: служба слушает только `127.0.0.1`.
 
 ## Шаг 9. Переключение и замер
@@ -200,8 +220,9 @@ sudo ufw enable
 1. На рабочем ПК **остановить сервер и бота**. Две копии бота на одном
    токене мешают друг другу. Локальный голосовой режим (`--voice`,
    `--wake`) на рабочем ПК запускать можно, он ни с кем не делит токен.
-2. Отдать новому ПК адрес `192.168.31.35` (или поменять `server.url` на
-   спутнике), запустить службы.
+2. Закрепить текущий адрес `192.168.31.172` в роутере либо записать
+   выданный адрес в `server.url` спутника и Telegram-бота, затем запустить
+   службы.
 3. Проверить: вопрос из Telegram, спутник с ноутбука, напоминание на пару
    минут вперёд — **первая живая доставка за всю историю проекта**.
 4. **Замерить распознавание на GTX 1650** по журналу (задержка STT на
@@ -273,13 +294,17 @@ sudo ufw enable
 
 ```sh
 sudo apt install curl
-cd /opt/alisa_selfhosted
+cd /home/chupep/dimarep
 sudo install -m 755 infra/alisa-update.sh /usr/local/bin/alisa-update
 sudo cp infra/alisa-update.service infra/alisa-update.timer /etc/systemd/system/
 sudo cp infra/alisa-update.conf.example /etc/alisa-update.conf   # по желанию
 sudo systemctl daemon-reload
 sudo systemctl enable --now alisa-update.timer
 ```
+
+На 02.11.2026 таймер ещё не установлен. Коммит с путями и шаблонами
+для этой машины опубликован; осталось установить службу и проверить её
+первый прогон.
 
 - **Скрипт ставится копией в `/usr/local/bin`, а не запускается из
   репозитория.** bash читает файл по ходу выполнения, и `git pull`
@@ -288,7 +313,7 @@ sudo systemctl enable --now alisa-update.timer
   повторить `sudo install` руками**, сам себя он не обновляет. То же с
   файлами служб в `/etc/systemd/system/`.
 - Служба работает от root (ей надо перезапускать службы), а `git` и
-  `pip` зовёт от владельца `/opt/alisa_selfhosted`, с его `HOME` — там
+  `pip` зовёт от владельца `/home/chupep/dimarep`, с его `HOME` — там
   ключ для GitHub.
 
 ### Посмотреть и вмешаться
@@ -308,6 +333,6 @@ sudo systemctl stop alisa-update.timer    # приостановить авто�
 ### Руками, если таймер выключен
 
 ```sh
-cd /opt/alisa_selfhosted && git pull
+cd /home/chupep/dimarep && git pull
 sudo systemctl restart alisa-reminders alisa-server alisa-telegram
 ```
