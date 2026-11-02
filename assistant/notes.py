@@ -156,6 +156,11 @@ class NoteDialogue:
             self.reset()
             return "Записала."
 
+        if REMINDER_INTENT.search(question):
+            # Даже ответ на «что записать?» может оказаться новой просьбой
+            # напомнить. Не превращаем её в текст заметки.
+            self.reset()
+            return None
         text = note_request(question)
         if text is None and self.awaiting_text:
             # Ответ на «что записать?» — это и есть заметка.

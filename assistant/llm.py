@@ -38,7 +38,7 @@ from .prompt import (
 )
 from .search import EMPTY_RESULT_MARKER, SearchTools, make_backend
 from .streaming import check_cancelled
-from .reminder_dialogue import ReminderDialogue, INTENT as REMINDER_INTENT
+from .reminder_dialogue import ReminderDialogue, is_reminder_command
 from .notes import NoteDialogue, note_request
 
 log = logging.getLogger(__name__)
@@ -593,7 +593,7 @@ class Assistant:
         с первой фразы. Иначе сказку пришлось бы слушать после минуты
         тишины — сперва вся генерация, и только потом звук.
         """
-        if REMINDER_INTENT.search(question) or self.reminders.pending or self.reminders.context:
+        if is_reminder_command(question) or self.reminders.pending or self.reminders.context:
             return False
         if note_request(question) is not None or self.notes.active:
             return False

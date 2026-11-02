@@ -54,6 +54,17 @@ class ParseTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIsNone(note_request(phrase))
 
+    def test_reminder_guard_still_checks_the_whole_phrase(self):
+        for phrase in (
+            "напомни записать в заметки про шланг",
+            "Напомню, через 2 минуты записать в заметки про шланг",
+            "Запиши в заметки: напомни завтра проверить духовку",
+            "Запиши в заметки: напомню завтра проверить духовку",
+            "Запиши в заметки, что нужно создать напоминание",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(note_request(phrase))
+
 
 class DialogueTests(unittest.TestCase):
     def setUp(self):
@@ -95,6 +106,18 @@ class DialogueTests(unittest.TestCase):
         self.assertIn("Краска кончилась", self.dialogue.handle("Краска кончилась."))
         self.dialogue.handle("подтверждаю")
         self.assertIn("— Краска кончилась\n", self.path.read_text(encoding="utf-8"))
+
+    def test_reminder_is_not_used_as_reply_to_what_to_write(self):
+        for phrase in (
+            "Напомни записать в заметки про шланг завтра утром",
+            "Напомню, через 2 минуты записать в заметки про шланг",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(self.dialogue.handle("запиши заметку"), "Что записать?")
+                self.assertIsNone(self.dialogue.handle(phrase))
+                self.assertFalse(self.dialogue.active)
+                self.assertIsNone(self.dialogue.handle("подтверждаю"))
+                self.assertFalse(self.path.exists())
 
     def test_remove_last_touches_only_dictated_lines(self):
         self.assertIn("нечего", self.dialogue.handle("удали последнюю заметку"))

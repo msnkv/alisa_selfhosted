@@ -19,7 +19,29 @@ from zoneinfo import ZoneInfo
 from .reminders import exact_time, parse_local_time
 from .streaming import check_cancelled
 
-INTENT = re.compile(r"\b(?:напомни|напомнить|напоминание|напоминания)\b", re.I)
+# Широкое упоминание нужно заметкам: не записывать просьбу напомнить
+# как текст заметки. Для запуска диалога этот шаблон слишком широк.
+INTENT = re.compile(r"\b(?:напомни|напомню|напомнить|напоминание|напоминания)\b", re.I)
+_LEAD = (
+    r"(?:(?:а|и|ещё|еще|также|тогда|так|ну|слушай|давай|пожалуйста|мне|"
+    r"можешь|можно|ты|могла\s+бы|не\s+могла\s+бы|алиса(?:[\s-]*тян)?)[\s,]+)*"
+)
+COMMAND = re.compile(
+    r"^\s*" + _LEAD + r"(?:напомни|напомню|напомнить|"
+    r"(?:создай|сделай|поставь|установи|добавь)"
+    r"(?:[\s,]+(?:пожалуйста|мне))*[\s,]+напоминание)\b",
+    re.I,
+)
+CANCELLATION = re.compile(r"отмени напоминание ([a-f0-9]{32})")
+
+
+def is_reminder_command(question: str) -> bool:
+    """Создание или управление напоминаниями, а не упоминание в разговоре."""
+    normalized = re.sub(r"[^\w\s]", "", question.lower()).strip()
+    return bool(COMMAND.match(question) or normalized == "мои напоминания"
+                or CANCELLATION.fullmatch(normalized))
+
+
 YES = {"да", "подтверждаю", "да подтверждаю", "сохрани", "сохрани напоминание",
        "да сохрани", "да сохрани напоминание", "подтверждаю напоминание"}
 NO = {"нет", "отмена", "отмени", "не надо", "не сохраняй"}
@@ -116,7 +138,7 @@ class ReminderDialogue:
                 f"{row['id']}: {exact_time(row['due'], row['zone'])} — {row['text']} "
                 f"[{row['status']}]" for row in rows
             )
-        cancellation = re.fullmatch(r"отмени напоминание ([a-f0-9]{32})", normalized)
+        cancellation = CANCELLATION.fullmatch(normalized)
         if cancellation:
             self.reset()
             if not self.client.url:
@@ -128,7 +150,7 @@ class ReminderDialogue:
                 return str(exc)
             return "Напоминание отменено."
 
-        intent = bool(INTENT.search(question))
+        intent = is_reminder_command(question)
         if not intent and not self.context:
             # Несвязанная реплика не оставляет скрытого подтверждения на потом.
             self.reset()

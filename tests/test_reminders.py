@@ -17,13 +17,59 @@ from unittest.mock import Mock, patch
 
 from assistant.config import RemindersConfig, load_config
 from assistant.llm import Assistant
-from assistant.reminder_dialogue import ReminderClient, ReminderDialogue, ReminderError
+from assistant.reminder_dialogue import (
+    ReminderClient, ReminderDialogue, ReminderError, is_reminder_command,
+)
 from assistant.reminders import LEASE_SECONDS, ReminderStore, deliver_one, make_handler, parse_local_time
 from assistant.telegram_bot import TelegramError
 from assistant.streaming import AnswerCancelled
 
 NOW = datetime(2030, 1, 1, 12, tzinfo=timezone.utc).timestamp()
 LOCAL_TIME = "2030-01-02T07:00:00"
+
+
+class IntentTests(unittest.TestCase):
+    def test_creation_commands_start_the_phrase(self):
+        for phrase in (
+            "Напомни через 111 минут проверить духовку",
+            "Напомню через 111 минут проверить духовку",
+            "Напомню, через 2 часа проверить духовку",
+            "Напомню, через 2 минуты проверить духовку",
+            "  НАПОМНЮ, через две минуты проверить духовку",
+            "Алиса-тян, пожалуйста, напомни мне завтра позвонить",
+            "А ещё напомню через две минуты проверить духовку",
+            "Можешь мне напомнить завтра позвонить?",
+            "Не могла бы ты напомнить завтра позвонить?",
+            "Создай напоминание через час проверить духовку",
+            "Поставь, пожалуйста, мне напоминание через час",
+            "напомни записать в заметки про шланг",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(is_reminder_command(phrase))
+
+    def test_mentions_and_questions_are_not_creation_commands(self):
+        for phrase in (
+            "почему напоминания не работают",
+            "напоминания не работают",
+            "Напоминание не пришло",
+            "У тебя есть напоминания?",
+            "Ты умеешь напомнить через час?",
+            "Не напомни через час, я передумал",
+            "Не создавай напоминание",
+            "Как создать напоминание?",
+            "Я просил: напомни через два часа",
+            "Я просил: напомню через два часа",
+            "Напоминательный сервис выключен",
+            "Мы перенесли сервер. Напоминания не работают, "
+            "хотя я просил напомнить через два часа. Почему?",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertFalse(is_reminder_command(phrase))
+
+    def test_management_commands_still_disable_long_form(self):
+        for phrase in ("Мои напоминания!", "Отмени напоминание " + "a" * 32):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(is_reminder_command(phrase))
 
 
 class StoreFixture:
@@ -188,6 +234,41 @@ class HTTPAndDialogueTests(StoreFixture, unittest.TestCase):
         self.extract.assert_called_once()
         self.assertIsNone(self.handle("да"))
 
+    def test_transcribed_napomnyu_previews_without_saving(self):
+        for phrase in (
+            "Напомню через 111 минут проверить духовку",
+            "Напомню, через 2 часа проверить духовку",
+            "Напомню, через 2 минуты проверить духовку",
+        ):
+            with self.subTest(phrase=phrase):
+                self.flow.reset()
+                self.extract.reset_mock()
+                self.assertIn("Пока не сохранено", self.handle(phrase))
+                self.extract.assert_called_once()
+                self.assertIsNotNone(self.flow.pending)
+                self.assertEqual(self.flow.context, [])
+                self.assertEqual(self.store.active(), [])
+
+    def test_complaint_does_not_open_context_before_a_new_command(self):
+        for phrase in (
+            "почему напоминания не работают",
+            "Мы перенесли сервер. Напоминания не работают, "
+            "хотя я просил напомнить через два часа. Почему?",
+        ):
+            with self.subTest(phrase=phrase):
+                with patch.object(self.flow.client, "request") as service:
+                    self.assertIsNone(self.handle(phrase))
+                    self.assertIsNone(self.handle("подтверждаю"))
+                    service.assert_not_called()
+                self.extract.assert_not_called()
+                self.assertEqual(self.flow.context, [])
+                self.assertIsNone(self.flow.pending)
+        self.assertIn("Пока не сохранено", self.handle("Напомню, через 2 минуты проверить духовку"))
+        self.assertEqual(len(self.extract.call_args.args[0]), 2)
+        self.assertEqual(self.store.active(), [])
+        self.assertIn("сохранено", self.handle("подтверждаю"))
+        self.assertEqual(len(self.store.active()), 1)
+
     def test_ambiguous_hour_clarifies_then_previews(self):
         self.extract.return_value = {"text": "поставить тесто", "local_time": "", "question": "В семь утра или вечера?"}
         self.assertIn("утра или вечера", self.handle("Напомни завтра в семь поставить тесто"))
@@ -199,6 +280,16 @@ class HTTPAndDialogueTests(StoreFixture, unittest.TestCase):
         self.assertIn("2030-01-01", messages[0]["content"])
         self.assertIn("Напомни завтра", messages[1]["content"])
         self.assertEqual(self.store.active(), [])
+
+    def test_napomnyu_still_supports_clarification(self):
+        self.extract.return_value = {"text": "поставить тесто", "local_time": "",
+                                     "question": "В семь утра или вечера?"}
+        self.assertIn("утра или вечера", self.handle("Напомню завтра в семь поставить тесто"))
+        self.extract.return_value = {"text": "поставить тесто", "local_time": LOCAL_TIME, "question": ""}
+        self.assertIn("Пока не сохранено", self.handle("Утра"))
+        self.assertEqual(self.store.active(), [])
+        self.assertEqual(self.flow.context, [])
+        self.assertIsNotNone(self.flow.pending)
 
     def test_cancel_and_unrelated_reply_invalidate_preview(self):
         for reply in ("отмена", "Какая погода?"):
@@ -279,12 +370,33 @@ class HTTPAndDialogueTests(StoreFixture, unittest.TestCase):
         self.assertIsNone(assistant.reminders.pending)
         self.assertEqual(self.store.active(), [])
 
+    def test_reminder_after_note_prompt_reaches_reminder_handler(self):
+        cfg = load_config()
+        cfg = replace(cfg, reminders=self.settings, data_dir=Path(self.tmp.name),
+                      log_dir=Path(self.tmp.name), dialogue_log=False,
+                      search=replace(cfg.search, enabled=False))
+        assistant = Assistant(cfg).new_session("satellite:test")
+        call = NS(function=NS(name="propose_reminder", arguments=json.dumps(self.extract.return_value)))
+        with patch.object(assistant, "_step", return_value=("", [call], None)) as api:
+            self.assertEqual(assistant.ask("запиши заметку").tools_used, ["note"])
+            api.assert_not_called()
+            answer = assistant.ask("Напомню, через 2 минуты записать в заметки про шланг")
+            self.assertEqual(answer.tools_used, ["reminder"])
+            self.assertIn("Пока не сохранено", answer.text)
+            api.assert_called_once()
+        self.assertFalse(assistant.notes.active)
+        self.assertFalse((Path(self.tmp.name) / "notes.md").exists())
+        self.assertEqual(self.store.active(), [])
+
     def test_assistant_streams_preview_and_confirm_and_forget_clears_draft(self):
         cfg = load_config()
         cfg = replace(cfg, reminders=self.settings, log_dir=Path(self.tmp.name), dialogue_log=False,
                       search=replace(cfg.search, enabled=False))
         assistant = Assistant(cfg).new_session("satellite:test")
         assistant.long_form = True
+        self.assertFalse(assistant.will_be_long_form("Напомню, через 2 минуты проверить духовку"))
+        self.assertTrue(assistant.will_be_long_form("почему напоминания не работают"))
+        self.assertFalse(assistant.will_be_long_form("Мои напоминания"))
         call = NS(function=NS(name="propose_reminder", arguments=json.dumps(self.extract.return_value)))
         sentences, steps = [], []
         with patch.object(assistant, "_step", return_value=("Сохранено!", [call], None)) as api:
